@@ -304,27 +304,47 @@ class TestCriticalPaths(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_heard_event_contains_text_after_interruption(self):
-        """[HEARD] event written to ADK session must carry non-empty spoken text.
+        """[HEARD] event is written for sentences that fully played before interruption.
 
-        make_adk_aware_tts pushes AdkTTSSpeakingTextFrame before audio, so
-        AdkAssistantContextAggregator has the text in its buffer at the moment
-        the InterruptionFrame fires. This test verifies that chain end-to-end.
+        Pipecat appends TTSTextFrame AFTER all audio for each sentence. Only
+        sentences whose audio played to completion (and whose TTSTextFrame
+        passed through the output transport) populate _context_aggregation and
+        thus appear in the [HEARD] event.
+
+        This test uses a two-sentence response and interrupts during sentence 2.
+        Sentence 1 ("Done.") plays fully — its TTSTextFrame reaches the aggregator.
+        Sentence 2 is still playing when the interruption fires, so [HEARD]
+        contains only sentence 1's text.
         """
+        # Two-sentence response. TTSService detects the period after "Done." and
+        # calls run_tts twice (once per sentence), producing two separate TTSTextFrames.
         app = self._make_app(MockLLM.single(
-            "I'm about to tell you a very long story that goes on and on forever..."
+            "Done. Now this is a much longer second sentence that will still be playing when interrupted."
         ))
 
         async with TestRunner(app=app, tts_delay=0.05) as runner:
             await runner.join()
             await runner.speak("Tell me something")
-            await runner.interrupt_bot("Stop!", timeout=5.0)
 
-            def _has_user_transcription(_bot_output, delta):
+            # Wait until the first sentence's TTSTextFrame has been emitted by TTS
+            # (RTVI sends bot-tts-text when it observes TTSTextFrame leaving TTS service).
+            # By this point the first sentence's audio has fully played and its
+            # TTSTextFrame is in the output transport queue, about to reach the aggregator.
+            def _first_sentence_emitted(_bot_output, delta):
+                return any(m.get("type") == "bot-tts-text" for m in delta)
+            await runner.wait_for(_first_sentence_emitted, timeout=5.0)
+
+            # Interrupt during sentence 2. stay_silent lets the event loop deliver
+            # TTSTextFrame1 to AdkAssistantContextAggregator before the interruption fires.
+            await runner.stay_silent(iterations=5)
+            await runner.speak("Stop please")
+
+            def _has_final_transcription(_bot_output, delta):
                 return any(
                     m.get("type") == "user-transcription" and m.get("data", {}).get("final")
                     for m in delta
                 )
-            await runner.wait_for(_has_user_transcription, timeout=5.0)
+            await runner.wait_for(_has_final_transcription, timeout=5.0)
 
         events = await runner.events()
         heard_events = [
@@ -349,7 +369,7 @@ class TestCriticalPaths(unittest.IsolatedAsyncioTestCase):
                 heard_text = match.group(1)
                 self.assertGreater(
                     len(heard_text), 0,
-                    f"[HEARD] event has empty heard text: {text!r}",
+                    f"[HEARD] event has empty heard text — was sentence 1 played fully? {text!r}",
                 )
 
     async def test_no_heard_event_on_clean_turn(self):
@@ -358,7 +378,7 @@ class TestCriticalPaths(unittest.IsolatedAsyncioTestCase):
         On a clean (uninterrupted) turn, make_adk_aware_tts fires
         on_audio_context_completed, which pushes AdkAudioContextCompletedFrame.
         AdkAssistantContextAggregator pops that context_id, so no [HEARD] event
-        is written even though AdkTTSSpeakingTextFrame was buffered.
+        is written even if TTSTextFrame had populated _context_aggregation.
         """
         app = self._make_app(MockLLM.single("I will answer your question completely."))
 
