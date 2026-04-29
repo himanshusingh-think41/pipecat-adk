@@ -31,7 +31,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 
-from .frames import AdkAudioContextCompletedFrame, AdkContextFrame
+from .frames import AdkAudioContextCompletedFrame, AdkContextFrame, AdkTTSSpeakingTextFrame
 from .types import SessionParams
 
 
@@ -158,13 +158,19 @@ class AdkAssistantContextAggregator(LLMAssistantAggregator):
         return aggregation
 
     async def _handle_text(self, frame) -> None:
-        """Accumulate spoken text per TTS context_id alongside parent tracking."""
+        """Delegate text tracking to parent; [HEARD] accumulation uses AdkTTSSpeakingTextFrame."""
         await super()._handle_text(frame)
-        if isinstance(frame, TTSTextFrame) and frame.context_id and frame.text:
-            self._context_aggregation.setdefault(frame.context_id, []).append(frame.text)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        if isinstance(frame, AdkAudioContextCompletedFrame):
+        if isinstance(frame, AdkTTSSpeakingTextFrame):
+            # Accumulate text BEFORE audio plays so [HEARD] events contain the
+            # actual spoken text even when the bot is interrupted mid-sentence.
+            # TTSTextFrame arrives after all audio (by pipecat design) and is
+            # therefore too late to use for interruption tracking.
+            if frame.context_id and frame.text:
+                self._context_aggregation.setdefault(frame.context_id, []).append(frame.text)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, AdkAudioContextCompletedFrame):
             # Audio for this context played fully — no interruption, no [HEARD] needed.
             self._context_aggregation.pop(frame.context_id, None)
         else:

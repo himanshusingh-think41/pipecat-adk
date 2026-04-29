@@ -3,7 +3,7 @@ from .aggregators import (
     AdkContextAggregatorPair,
     AdkUserContextAggregator,
 )
-from .frames import AdkAudioContextCompletedFrame, AdkContextFrame
+from .frames import AdkAudioContextCompletedFrame, AdkContextFrame, AdkTTSSpeakingTextFrame
 from .interruption import AdkInterruptionPlugin
 from .service import AdkBasedLLMService
 from .tts_invocation import make_adk_aware_tts
@@ -21,6 +21,7 @@ __all__ = [
     # Frames
     "AdkContextFrame",
     "AdkAudioContextCompletedFrame",
+    "AdkTTSSpeakingTextFrame",
     # Plugin
     "AdkInterruptionPlugin",
     # TTS factory
