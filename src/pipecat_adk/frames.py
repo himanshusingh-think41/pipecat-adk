@@ -27,22 +27,3 @@ class AdkAudioContextCompletedFrame(SystemFrame):
     """
 
     context_id: str
-
-
-@dataclass
-class AdkTTSSpeakingTextFrame(SystemFrame):
-    """Carries TTS text immediately before audio synthesis begins.
-
-    Pushed by make_adk_aware_tts at the start of run_tts, before any audio
-    frames are yielded. Because it is a SystemFrame it bypasses the audio
-    context queue and reaches AdkAssistantContextAggregator immediately,
-    giving the aggregator the heard-text to use in a [HEARD] event if the
-    bot is interrupted mid-speech.
-
-    TTSTextFrame (the standard pipecat frame) is intentionally appended
-    *after* all audio, so it arrives too late for interruption tracking.
-    This frame fills that gap.
-    """
-
-    context_id: str
-    text: str

@@ -39,7 +39,7 @@ from pipecat.services.tts_service import TTSService
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 
-from pipecat_adk.frames import AdkAudioContextCompletedFrame, AdkContextFrame, AdkTTSSpeakingTextFrame
+from pipecat_adk.frames import AdkAudioContextCompletedFrame, AdkContextFrame
 
 
 # Fields whose values should never appear in logs (binary data, internals).
