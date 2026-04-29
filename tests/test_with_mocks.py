@@ -30,7 +30,6 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             instruction="You are a helpful assistant.",
         )
 
-        # Create App with InterruptionHandlerPlugin
         # Note: app name must be "agents" to match TestRunner's hardcoded session_params
         app = App(
             name="agents",

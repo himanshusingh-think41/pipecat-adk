@@ -30,13 +30,11 @@ from pipecat.services.google import GoogleLLMService
 from pipecat.services.google.llm import GoogleLLMContext
 from pipecat.pipeline.pipeline import Pipeline
 
-# Standard LLM service
 llm = GoogleLLMService(
     model="gemini-2.0-flash",
     api_key=os.getenv("GEMINI_API_KEY"),
 )
 
-# Standard context aggregator
 context_aggregator = llm.create_context_aggregator(
     GoogleLLMContext(messages=[{"role": "system", "content": "You are helpful"}])
 )
@@ -55,10 +53,10 @@ pipeline = Pipeline([
 ### After (With pipecat-adk)
 
 ```python
-from pipecat_adk import AdkBasedLLMService, SessionParams, InterruptionHandlerPlugin
+from pipecat_adk import AdkBasedLLMService, AdkInterruptionPlugin, SessionParams, make_adk_aware_tts
 from google.adk.agents import Agent
-from google.adk.apps import App
 from google.adk.sessions import InMemorySessionService
+from pipecat.services.google.tts import GoogleTTSService
 from pipecat.pipeline.pipeline import Pipeline
 
 # 1. Define your ADK agent
@@ -68,30 +66,28 @@ agent = Agent(
     instruction="You are a helpful assistant.",
 )
 
-# 2. Create an ADK App with the InterruptionHandlerPlugin
-app = App(
-    name="my_app",
-    root_agent=agent,
-    plugins=[InterruptionHandlerPlugin()],  # Required for interruption handling
-)
-
-# 3. Set up session management
+# 2. Set up session management
 session_service = InMemorySessionService()
 session_params = SessionParams(
-    app_name=app.name,
+    app_name="my_app",
     user_id="user_123",
     session_id="session_456",
 )
 await session_service.create_session(**session_params.model_dump())
 
-# 4. Create the LLM service
+# 3. Create the LLM service (manages the ADK App internally)
 llm = AdkBasedLLMService(
+    agent=agent,
     session_service=session_service,
     session_params=session_params,
-    app=app,
+    plugins=[AdkInterruptionPlugin()],
 )
 
-# 5. Create context aggregators and pipeline (structure stays the same!)
+# 4. Wrap TTS for accurate interruption tracking
+AdkAwareTTS = make_adk_aware_tts(GoogleTTSService)
+tts = AdkAwareTTS(voice_id=...)
+
+# 5. Create context aggregators — pipeline structure stays the same
 context_aggregator = llm.create_context_aggregator()
 
 pipeline = Pipeline([
@@ -99,13 +95,13 @@ pipeline = Pipeline([
     stt_service,
     context_aggregator.user(),
     llm,
-    tts_service,
+    tts,
     transport.output(),
     context_aggregator.assistant(),
 ])
 ```
 
-The pipeline structure stays the same—you just swap the LLM service and context aggregator.
+The pipeline structure stays the same—you swap the LLM service, context aggregator, and TTS wrapper.
 
 ## Key Challenges Solved
 
@@ -113,9 +109,10 @@ The pipeline structure stays the same—you just swap the LLM service and contex
 
 **The Problem**: Pipecat manages conversation history by accumulating messages in an `LLMContext`. This works for simple cases, but breaks down when you need sophisticated history management, multi-turn reasoning, or agent handoffs.
 
-**Our Solution**: ADK manages the conversation history. When a user speaks, our `AdkUserContextAggregator`:
-1. Clears Pipecat's context (since ADK owns the history)
-2. Passes the message to ADK for processing
+**Our Solution**: ADK manages the conversation history. When a user speaks, `AdkUserContextAggregator`:
+1. Persists the user event directly to ADK's session store
+2. Clears Pipecat's context (since ADK owns the history)
+3. Pushes `AdkContextFrame(invocation_id=...)` to trigger the LLM service
 
 The user's transcription is sent directly to ADK without modification.
 
@@ -130,113 +127,95 @@ The user's transcription is sent directly to ADK without modification.
 - `DatabaseSessionService` for production persistence
 - Custom implementations for your specific needs
 
-Every event is persisted automatically. You get:
-- Full conversation history across restarts
-- Ability to replay and analyze sessions
-- Audit trails for compliance
-- Session handoff between agents
+Every event is persisted automatically. You get full conversation history across restarts, audit trails for compliance, and session handoff between agents.
 
-**Tradeoff**: You need to manage session IDs and ensure they're unique per conversation. You also need to handle session cleanup/expiration.
+**Tradeoff**: You need to manage session IDs and ensure they're unique per conversation. You also need to handle session cleanup and expiration.
 
 ### 3. Interruption Handling
 
-**The Problem**: When a user interrupts the AI mid-sentence, standard LLM integrations send the full planned response to the model on the next turn. The AI then responds as if the user heard everything—leading to confusing conversations.
+**The Problem**: When a user interrupts the AI mid-sentence, the LLM on the next turn sees the full planned response as if the user heard everything—leading to confusing conversations.
 
-**Our Solution**: The "accountant's approach"—we don't try to prevent events from being committed. Instead:
+**Our Solution**: A deterministic, two-part mechanism:
 
-1. ADK commits the full response immediately (natural flow)
-2. When interrupted, `AdkAssistantContextAggregator` adds a synthetic event: `<interruption>Hello, how can...</interruption>` containing only what was actually spoken
-3. Before the next LLM call, `InterruptionHandlerPlugin` scans the history and replaces the full response with just the spoken portion
-4. The LLM only sees what the user actually heard
+1. When interrupted, `AdkAssistantContextAggregator` knows exactly what TTS text was spoken (it tracks text per audio context via `TTSTextFrame`). It writes a `[HEARD]` event to the ADK session containing only what was actually spoken.
+2. Before the next LLM call, `AdkInterruptionPlugin` finds the `[HEARD]` marker in the request, locates the preceding model event, and replaces its full text with the heard portion. The marker is then removed from the request.
 
-**Tradeoff**: The session history contains extra synthetic events. If you're analyzing raw session data, you'll need to filter these out. The plugin uses fuzzy matching to handle formatting variations, which very rarely might match incorrectly.
+The LLM sees only what the user actually heard. The full response remains in ADK session history for auditing.
+
+**Tradeoff**: The session history contains `[HEARD]` marker events. If you analyze raw session data you'll need to filter these. The `make_adk_aware_tts` factory must be used to wrap your TTS service—this signals when audio contexts complete cleanly (no `[HEARD]` needed), keeping the tracking buffer accurate.
 
 ### 4. State Management
 
-**The Problem**: Voice applications often need to track state—form data, user preferences, game scores, etc. Coordinating this state between the client and the AI is tedious.
+**The Problem**: ADK tools and events often produce state changes that clients need to know about. Coordinating this state between the AI and your application is tedious.
 
-**Our Solution**: ADK's state management flows through to clients via three frame types:
-
-- **`AdkStateDeltaFrame`**: Emitted when ADK produces state changes (from tools or events). Send this to your client to sync state.
-- **`AdkAppendEventFrame`**: Client sends this to persist an event without triggering an LLM response. Use for form submissions, state updates, etc.
-- **`AdkInvokeAgentFrame`**: Client sends this to trigger an LLM response after a state change. Use when you need the AI to react to client input.
-
-Example: A quiz application where the client submits answers:
+**Our Solution**: Override `_on_state_delta()` in a subclass of `AdkBasedLLMService`. The bridge calls this for every ADK event that carries a `state_delta`, before any text frames from the same event—so the client receives state before the bot starts speaking.
 
 ```python
-from google.adk.events import Event, EventActions
-from google.genai import types as genai_types
-from pipecat_adk import AdkAppendEventFrame, AdkInvokeAgentFrame
-
-# Client submits answer (persist without LLM response)
-event = Event(
-    author="user",
-    content=genai_types.Content(
-        role="user",
-        parts=[genai_types.Part(text="<answer>Paris</answer>")]
-    ),
-    actions=EventActions(state_delta={"score": 10})
-)
-await task.queue_frame(AdkAppendEventFrame(event=event))
-
-# Or if you want the AI to respond to the submission
-content = genai_types.Content(
-    role="user",
-    parts=[genai_types.Part(text="Check my answer: Paris")]
-)
-await task.queue_frame(AdkInvokeAgentFrame(
-    new_content=content,
-    state_delta={"last_answer": "Paris"}
-))
+class MyLLMService(AdkBasedLLMService):
+    async def _on_state_delta(self, state_delta: dict) -> None:
+        # Forward state to your client via RTVI, WebSocket, etc.
+        await self.push_frame(RTVIServerMessageFrame(
+            data={"type": "state-sync", "state_delta": state_delta}
+        ))
 ```
 
-**Tradeoff**: You need to handle these custom frame types in your transport. The library doesn't automatically send state to clients—you need to capture `AdkStateDeltaFrame` and send it through your WebSocket/WebRTC data channel.
+To inject events programmatically (e.g., a timeout or a form submission), override `process_frame` and call `_persist_and_run`:
+
+```python
+class MyLLMService(AdkBasedLLMService):
+    async def process_frame(self, frame, direction):
+        if isinstance(frame, UserIdleFrame):
+            await self._persist_and_run(
+                content=Content(role="user", parts=[
+                    Part(text="<system>User has been idle for 30s.</system>")
+                ])
+            )
+        else:
+            await super().process_frame(frame, direction)
+```
+
+**Tradeoff**: State integration requires subclassing `AdkBasedLLMService`. This keeps the bridge lean but means simple state forwarding can't be done with configuration alone.
 
 ### 5. Function Call Lifecycle
 
-**The Problem**: When an AI calls a tool, you often want to mute the microphone (to avoid picking up silence as speech) or show a loading indicator. Pipecat has `FunctionCallInProgressFrame` for this, but standard integrations don't always emit it correctly.
+**The Problem**: When an AI calls a tool, you often want to mute the microphone or show a loading indicator. Standard integrations don't always emit the right frames at the right time.
 
-**Our Solution**: When ADK generates a function call, we push frames both upstream and downstream:
+**Our Solution**: When ADK executes a function call, the bridge pushes frames both upstream and downstream:
 
-1. `FunctionCallsStartedFrame` → enables components like `STTMuteFilter` to mute the mic
-2. `FunctionCallInProgressFrame` → lets your UI show "thinking..." or similar
+1. `FunctionCallsStartedFrame` → enables `STTMuteFilter` to mute the mic
+2. `FunctionCallInProgressFrame` → lets your UI show "thinking..."
 3. ADK executes the function
 4. `FunctionCallResultFrame` → lets your UI show results, unmutes mic
 
-These frames flow upstream (to processors before the LLM) and downstream (to processors after), keeping everyone informed.
-
-**Tradeoff**: Function calls are managed entirely by ADK. You define tools using ADK's `FunctionTool` or similar, not Pipecat's function calling mechanism. The frames inform Pipecat of the lifecycle but don't give you hooks to intercept or modify the calls.
+**Tradeoff**: Function calls are managed entirely by ADK. You define tools using ADK's `FunctionTool` or as plain Python functions, not Pipecat's function calling mechanism. The frames inform Pipecat of the lifecycle but don't let you intercept or modify the calls.
 
 ### 6. Custom Context Injection
 
-**The Problem**: You need to inject dynamic context into conversations—current time, user preferences, system warnings, etc.
+**The Problem**: You need to inject dynamic context into conversations—current time, user preferences, system state, etc.
 
-**Our Solution**: Override `_aggregation_to_content()` in `AdkUserContextAggregator`:
+**Our Solution**: Override `_build_user_event()` in a subclass of `AdkUserContextAggregator`:
 
 ```python
-from pipecat_adk.context_aggregators import AdkUserContextAggregator
+from pipecat_adk.aggregators import AdkUserContextAggregator
+from google.adk.events import Event, EventActions
 from google.genai.types import Content, Part
 
 class MyUserAggregator(AdkUserContextAggregator):
-    async def _aggregation_to_content(self, aggregation: str) -> Content:
-        parts = []
-
-        # Add current time
-        parts.append(Part(text=f"<system>Current time: {datetime.now()}</system>"))
-
-        # Add user preferences from database
-        prefs = await self.get_user_preferences()
-        parts.append(Part(text=f"<system>User prefers {prefs.language}</system>"))
-
-        # Add the actual user message
-        parts.append(Part(text=aggregation))
-
-        return Content(role="user", parts=parts)
+    async def _build_user_event(self, text: str, session) -> Event:
+        parts = [
+            Part(text=f"<system>Current time: {datetime.now()}</system>"),
+            Part(text=text),
+        ]
+        return Event(
+            invocation_id=Event.new_id(),
+            author="user",
+            content=Content(role="user", parts=parts),
+        )
 ```
 
-These parts are included with every user message.
+Then pass your aggregator to `create_context_aggregator` — or build the `AdkContextAggregatorPair` manually and use it in the pipeline.
 
-**Tradeoff**: This runs on every user message. Keep it lightweight—avoid slow database queries or API calls here.
+**Tradeoff**: This runs on every user message. Keep it lightweight—avoid slow database queries or API calls here, or at least await them with care.
 
 ## Pipecat Ecosystem Limitations
 
@@ -250,38 +229,17 @@ Standard Pipecat components expect to read/write messages via `OpenAILLMContext`
 
 | Component | What It Does | Why It's Incompatible |
 |-----------|--------------|----------------------|
-| **RTVI Processor** | Sends user message notifications to clients | Expects to read messages from context frames |
 | **Mem0 Memory Service** | Enhances context with retrieved memories | Expects to add messages to context before LLM |
 | **LangChain Framework** | Routes to LangChain agents | Alternative agent framework—use ADK or LangChain, not both |
 | **Strands Framework** | Routes to Strands agents | Alternative agent framework—use ADK or Strands, not both |
 | **IVR Navigator** | Stores messages for IVR mode switching | Expects to read/store messages from context |
 | **LLM Log Observer** | Logs conversation messages | Will show empty context (use ADK session inspection instead) |
 
-### Workarounds
-
-**For RTVI-style client notifications:**
-Instead of relying on RTVI's context inspection, emit custom frames from your transport when user messages are processed. You can access the message content in `AdkUserContextAggregator` before it's saved to ADK.
-
-**For memory/RAG integration:**
-Use ADK's built-in state management or implement memory retrieval in your agent's instruction template. ADK tools can also fetch and inject context.
-
-**For debugging/logging:**
-Inspect ADK sessions directly instead of relying on context observers:
-```python
-session = await session_service.get_session(
-    app_name=session_params.app_name,
-    user_id=session_params.user_id,
-    session_id=session_params.session_id,
-)
-for event in session.events:
-    print(f"{event.author}: {event.content}")
-```
-
 ### Compatible Components
 
 These Pipecat components work normally with pipecat-adk:
 - **STT services** (Google, Deepgram, etc.)
-- **TTS services** (Google, ElevenLabs, etc.)
+- **TTS services** (Google, ElevenLabs, Cartesia, etc.) — wrap with `make_adk_aware_tts`
 - **VAD analyzers** (Silero, WebRTC)
 - **Transports** (WebRTC, WebSocket)
 - **STTMuteFilter** (receives function call lifecycle frames)
@@ -291,7 +249,7 @@ These Pipecat components work normally with pipecat-adk:
 
 See [`examples/assistant/`](examples/assistant/) for a complete working application:
 
-- **`agent.py`**: Defines the ADK Agent, App, and includes `InterruptionHandlerPlugin`
+- **`agent.py`**: Defines the ADK Agent and includes `AdkInterruptionPlugin`
 - **`bot.py`**: Sets up the Pipecat pipeline with `AdkBasedLLMService`
 - **`run.py`**: FastAPI server for WebRTC signaling
 
@@ -309,135 +267,99 @@ Open http://localhost:7860 to interact with the voice assistant.
 
 ## Testing Your Application
 
-pipecat-adk provides a comprehensive mock testing infrastructure so you can test your agents without calling real APIs.
+pipecat-adk ships with a complete mock testing infrastructure so you can test your agents without real API calls. The test utilities live in `tests/mocks.py` and `tests/test_utils.py`—copy them to your project or add `tests/` to your path.
 
-**Note**: The testing utilities are located in `tests/mocks.py` and `tests/test_utils.py`. To use them in your own tests, you'll need to copy these files or add the tests directory to your path.
-
-### MockLLM
-
-Create mock LLM responses for testing:
-
-```python
-# Copy tests/mocks.py to your project, then:
-from mocks import MockLLM, TestRunner, Say, WaitForResponse
-
-# Simple text response
-mock_llm = MockLLM.single("Hello! How can I help?")
-
-# Multi-turn conversation
-mock_llm = MockLLM.conversation([
-    "Hello! How can I help?",
-    "Sure, I can help with that.",
-])
-
-# With function calls
-from google.genai.types import Part
-mock_llm = MockLLM.from_parts([
-    [Part.from_function_call(name="get_weather", args={"city": "NYC"})],
-    "The weather in NYC is sunny and 72°F.",
-])
-```
-
-### TestRunner
-
-Run end-to-end tests with simulated user actions:
+### Basic Test Structure
 
 ```python
 import unittest
-from mocks import MockLLM, TestRunner, Say, WaitForResponse
-from pipecat_adk import InterruptionHandlerPlugin
 from google.adk.agents import Agent
 from google.adk.apps import App
+from pipecat_adk import AdkInterruptionPlugin
+from mocks import MockLLM, TestRunner, Turn
 
 class TestMyAgent(unittest.IsolatedAsyncioTestCase):
-    async def test_basic_conversation(self):
-        # Create agent with mock LLM
-        mock_llm = MockLLM.conversation([
-            "Hello! I'm your assistant.",
-            "I'd be happy to help with that.",
-        ])
+    async def test_greeting(self):
+        mock_llm = MockLLM.single("Hello! How can I help?")
 
-        agent = Agent(name="test_agent", model=mock_llm)
-        app = App(
-            name="agents",  # Must match TestRunner's expected app name
-            root_agent=agent,
-            plugins=[InterruptionHandlerPlugin()],
-        )
+        agent = Agent(name="test_agent", model=mock_llm,
+                      instruction="You are helpful.")
+        app = App(name="agents", root_agent=agent,
+                  plugins=[AdkInterruptionPlugin()])
 
         async with TestRunner(app=app) as runner:
-            # First turn
-            response = await runner.simulate_user([
-                Say("Hello"),
-                WaitForResponse(),
-            ])
-            assert response.said("Hello! I'm your assistant.")
+            await runner.join()
+            await runner.speak_and_wait_for_response("Hi")
 
-            # Second turn
-            response = await runner.simulate_user([
-                Say("Can you help me?"),
-                WaitForResponse(),
-            ])
-            assert response.said("I'd be happy to help with that.")
+            assert runner.last_bot_message == "Hello! How can I help?"
 ```
 
-### User Actions DSL
+The `app.name` must be `"agents"` — `TestRunner` uses a hardcoded session scoped to that name.
 
-Simulate user behavior with these actions:
+### MockLLM
 
-- `Say(text)`: User speaks text
-- `WaitForResponse()`: Wait for bot to finish speaking
-- `WaitTillBotSays(text)`: Wait until bot says specific text
-- `InterruptAfter(wait_for, say)`: Interrupt after hearing specific text
+```python
+# Single response
+mock_llm = MockLLM.single("Hello!")
+
+# Multi-turn — one response per user message
+mock_llm = MockLLM.conversation(["Hello!", "Sure, I can help.", "You're welcome."])
+
+# Function calls — list of Parts per turn, or a string for text-only turns
+from google.genai.types import Part
+mock_llm = MockLLM.from_parts([
+    [Part.from_function_call(name="get_weather", args={"city": "NYC"})],
+    "The weather in NYC is sunny.",
+])
+```
+
+The number of responses must match the number of conversation turns, or later turns will time out.
+
+### Conversational API
+
+```python
+async with TestRunner(app=app) as runner:
+    await runner.join()
+
+    # Speak and wait for bot reply
+    await runner.speak_and_wait_for_response("Hello")
+    assert runner.last_bot_message == "Hello! How can I help you today?"
+
+    # Multi-turn with full transcript assertion
+    await runner.speak_and_wait_for_response("I need help")
+    assert runner.transcript == [
+        Turn("user", "Hello"),
+        Turn("bot", "Hello! How can I help you today?"),
+        Turn("user", "I need help"),
+        Turn("bot", "Sure, I can help with that."),
+    ]
+```
 
 ### Testing Interruptions
 
 ```python
-async def test_interruption_handling(self):
-    mock_llm = MockLLM.conversation([
-        "Let me tell you a very long story about many things...",
-        "Okay, I'll keep it brief.",
-    ])
-
-    agent = Agent(name="test_agent", model=mock_llm)
-    app = App(
-        name="agents",
-        root_agent=agent,
-        plugins=[InterruptionHandlerPlugin()],
-    )
-
-    async with TestRunner(app=app) as runner:
-        # User interrupts mid-response
-        response = await runner.simulate_user([
-            Say("Tell me a story"),
-            InterruptAfter("very long story", "Stop"),
-        ])
-
-        # Bot acknowledges interruption
-        response = await runner.simulate_user([
-            WaitForResponse(),
-        ])
-        assert response.said("brief")
+async with TestRunner(app=app, tts_delay=0.05) as runner:
+    await runner.join()
+    await runner.speak("Tell me a long story")
+    await runner.interrupt_bot("Wait, stop")
+    # Bot receives the interruption; verify session state as needed
 ```
 
-### Testing State and Events
+Use `tts_delay` to slow TTS output so the bot is still speaking when `interrupt_bot` fires.
+
+### Gray-Box Inspection
 
 ```python
-async def test_session_state(self):
-    # ... setup agent with tools that modify state ...
+async with TestRunner(app=app) as runner:
+    await runner.join()
+    await runner.speak_and_wait_for_response("Set my theme to dark")
 
-    async with TestRunner(app=app) as runner:
-        await runner.simulate_user([
-            Say("Set my preference to dark mode"),
-            WaitForResponse(),
-        ])
+    # Inspect ADK session state (what tools wrote)
+    state = await runner.session_state()
+    assert state.get("theme") == "dark"
 
-        # Check session state
-        state = await runner.session_state()
-        assert state.get("theme") == "dark"
-
-        # Check session events
-        events = await runner.events()
-        # events is a list of all ADK events in the session
+    # Inspect raw ADK events
+    events = await runner.events()
 ```
 
 ### Test Utilities
@@ -445,10 +367,8 @@ async def test_session_state(self):
 ```python
 from test_utils import simplify_events
 
-# Convert ADK events to simple tuples for assertions
 events = await runner.events()
 simplified = simplify_events(events)
-
 # Returns: [("user", "Hello"), ("agent", "Hi there!"), ...]
 ```
 
@@ -456,26 +376,24 @@ simplified = simplify_events(events)
 
 ### Core Classes
 
-- **`AdkBasedLLMService`**: Main LLM service that replaces `GoogleLLMService`
-- **`SessionParams`**: Dataclass for session identification (app_name, user_id, session_id)
-- **`InterruptionHandlerPlugin`**: ADK plugin for handling interruptions (must be in App's plugins)
+- **`AdkBasedLLMService(agent, session_service, session_params, plugins=[])`**: Main LLM service. Creates the ADK App and Runner internally. Override `_on_state_delta(state_delta)` to forward state to clients, and `process_frame` + `_persist_and_run(content, state_delta)` to inject system events.
+- **`SessionParams(app_name, user_id, session_id)`**: Dataclass for session identification.
+- **`AdkInterruptionPlugin`**: ADK plugin for deterministic interruption handling. Pass in `plugins=[AdkInterruptionPlugin()]` when creating the service.
 
-### Frame Types
+### TTS Factory
 
-- **`AdkStateDeltaFrame`**: Emitted when state changes occur (state_delta, source)
-- **`AdkAppendEventFrame`**: Request to append event without LLM invocation (event)
-- **`AdkInvokeAgentFrame`**: Request to invoke agent with optional state (new_content, state_delta)
+- **`make_adk_aware_tts(base_class)`**: Wraps any `TTSService` subclass to push `AdkAudioContextCompletedFrame` when an audio context plays to completion. Required for accurate interruption tracking.
 
 ### Context Aggregators
 
 Created via `llm.create_context_aggregator()`:
-- **User aggregator**: Packages speech for ADK, clears Pipecat context
-- **Assistant aggregator**: Tracks spoken text, handles interruptions
+- **User aggregator** (`AdkUserContextAggregator`): Persists speech to ADK, triggers the LLM service. Override `_build_user_event(text, session)` to inject custom context parts.
+- **Assistant aggregator** (`AdkAssistantContextAggregator`): Tracks spoken text per TTS audio context. Writes `[HEARD]` events on interruption.
 
 ## Requirements
 
 - Python >= 3.12
-- pipecat-ai >= 0.0.94
+- pipecat-ai >= 0.0.102, < 1.0.0
 - google-adk >= 1.18.0
 - google-genai >= 1.51.0
 

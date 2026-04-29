@@ -698,8 +698,8 @@ class TestRunner:
     async def queue_frame(self, frame: Frame):
         """Queue a frame into the pipeline task.
 
-        Use this to inject frames like AdkAppendEventFrame or AdkInvokeAgentFrame
-        directly into the pipeline for processing.
+        Use this to inject frames like AdkContextFrame directly into the pipeline
+        for processing.
 
         Raises:
             RuntimeError: If join() hasn't been called or task doesn't exist.
