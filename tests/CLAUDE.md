@@ -33,7 +33,7 @@ assert runner.transcript == [
 ```python
 from google.adk.agents import Agent
 from google.adk.apps import App
-from pipecat_adk import InterruptionHandlerPlugin
+from pipecat_adk import AdkInterruptionPlugin
 from tests.mocks import MockLLM, TestRunner, Turn
 
 class TestBasicFlow(unittest.IsolatedAsyncioTestCase):
@@ -51,7 +51,7 @@ class TestBasicFlow(unittest.IsolatedAsyncioTestCase):
         app = App(
             name="agents",
             root_agent=agent,
-            plugins=[InterruptionHandlerPlugin()],
+            plugins=[AdkInterruptionPlugin()],
         )
 
         async with TestRunner(app=app) as runner:
@@ -114,7 +114,7 @@ MockLLM.from_parts([
 | `speak_and_wait_for_response(text)` | Speak and wait for bot reply |
 | `interrupt_bot(text)` | Wait for bot to start speaking, then interrupt |
 | `push_message(type, data)` | Send client message |
-| `queue_frame(frame)` | Queue a frame (e.g., AdkAppendEventFrame) into pipeline |
+| `queue_frame(frame)` | Queue a frame (e.g., AdkContextFrame) into pipeline |
 | `stay_silent()` | Push silence frames to process async messages |
 | `wait_for_response()` | Wait for bot to finish speaking |
 | `wait_for(predicate)` | Wait for custom condition |
@@ -172,17 +172,12 @@ state = await runner.session_state()  # Now safe to assert
 
 ## Queueing Frames Directly
 
-Use `queue_frame()` to inject ADK frames directly into the pipeline:
+Use `queue_frame()` to inject frames directly into the pipeline:
 
 ```python
-# Append an event to ADK session (no LLM response)
-event = Event(author="user", actions=EventActions(state_delta={"key": "value"}))
-await runner.queue_frame(AdkAppendEventFrame(event=event))
-await runner.stay_silent()  # Process async frame
-
-# Invoke agent with new content (triggers LLM response)
-content = Content(role="user", parts=[Part(text="Please summarize.")])
-await runner.queue_frame(AdkInvokeAgentFrame(new_content=content))
+# Inject an ADK context frame (triggers LLM response)
+from pipecat_adk import AdkContextFrame
+await runner.queue_frame(AdkContextFrame(...))
 await runner.wait_for_response()  # Wait for LLM response
 ```
 

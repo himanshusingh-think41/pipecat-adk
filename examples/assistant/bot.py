@@ -3,7 +3,7 @@
 This example demonstrates:
 - Google ADK agents for conversation management
 - Pipecat for audio/video pipeline
-- Automatic interruption handling via InterruptionHandlerPlugin
+- Automatic interruption handling via AdkInterruptionPlugin
 - WebRTC transport via small-webrtc-prebuilt
 """
 
@@ -55,7 +55,7 @@ async def run_bot(webrtc_connection):
     await session_service.create_session(**session_params.model_dump())
 
     # Create ADK-based LLM service with the app from agent.py
-    # The app includes the agent and InterruptionHandlerPlugin
+    # The app includes the agent and AdkInterruptionPlugin
     llm = AdkBasedLLMService(
         session_service=session_service,
         session_params=session_params,

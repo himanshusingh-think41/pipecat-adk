@@ -5,7 +5,7 @@ This module defines the ADK App with the root agent and plugins.
 
 from google.adk.agents import Agent
 from google.adk.apps.app import App
-from pipecat_adk import InterruptionHandlerPlugin
+from pipecat_adk import AdkInterruptionPlugin
 
 
 SYSTEM_INSTRUCTION = """You are a helpful AI assistant. Be concise and friendly.
@@ -26,10 +26,9 @@ root_agent = Agent(
     instruction=SYSTEM_INSTRUCTION,
 )
 
-# Create ADK App with InterruptionHandlerPlugin
-# IMPORTANT: The InterruptionHandlerPlugin is required for proper interruption handling
+# Create ADK App with AdkInterruptionPlugin for proper interruption handling
 app = App(
     name="assistant",
     root_agent=root_agent,
-    plugins=[InterruptionHandlerPlugin()],
+    plugins=[AdkInterruptionPlugin()],
 )

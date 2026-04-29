@@ -27,11 +27,11 @@ uv run python -m unittest tests.test_with_mocks.TestIntegration.test_basic_inter
 ### Components
 
 1. **SessionParams** (`types.py`): Session identification
-2. **AdkUserContextAggregator** (`context_aggregators.py`): Packages user input for ADK
-3. **AdkAssistantContextAggregator** (`context_aggregators.py`): Tracks spoken text, handles interruptions
-4. **InterruptionHandlerPlugin** (`plugin.py`): Filters interrupted responses before LLM calls
-5. **AdkBasedLLMService** (`llm_service.py`): Main service replacing GoogleLLMService
-6. **Frame types** (`frames.py`): AdkStateDeltaFrame, AdkAppendEventFrame, AdkInvokeAgentFrame
+2. **AdkUserContextAggregator** (`aggregators.py`): Packages user input for ADK
+3. **AdkAssistantContextAggregator** (`aggregators.py`): Tracks spoken text, handles interruptions
+4. **AdkInterruptionPlugin** (`interruption.py`): Filters interrupted responses before LLM calls via `[HEARD]` markers
+5. **AdkBasedLLMService** (`service.py`): Main service replacing GoogleLLMService
+6. **Frame types** (`frames.py`): AdkContextFrame, AdkAudioContextCompletedFrame
 
 ### Data Flow
 
@@ -170,11 +170,7 @@ This tests the full chain: user input → aggregator → service → ADK → plu
 ### Test Organization
 
 - `test_with_mocks.py`: Main integration tests using TestRunner
-- `test_state_sync.py`: State synchronization frame tests
-- `test_plugin.py`: InterruptionHandlerPlugin edge cases
-- `test_llm_service.py`: LLM service conversion tests
-- `test_context_aggregator.py`: User aggregator tests
-- `test_assistant_context_aggregator.py`: Assistant aggregator tests
+- `test_plugin.py`: AdkInterruptionPlugin edge cases
 
 ## Manual Testing
 
@@ -217,9 +213,9 @@ for event in session.events:
     print(f"{event.author}: {event.content}")
 ```
 
-**Check interruption events**: Look for `<interruption>` tags in session history to verify the aggregator is creating them correctly.
+**Check interruption events**: Look for `[HEARD]` markers in session history to verify the aggregator is creating them correctly.
 
-**Check plugin filtering**: Add logging to `InterruptionHandlerPlugin.before_model_callback()` to see what it's filtering.
+**Check plugin filtering**: Add logging to `AdkInterruptionPlugin.before_model_callback()` to see what it's filtering.
 
 ## Code Patterns
 
@@ -296,12 +292,12 @@ async def my_extension_point(self):
 1. Check that `AdkAssistantContextAggregator._handle_interruptions()` is being called
 2. Verify the aggregator has accumulated text (it uses Pipecat's built-in tracking)
 3. Check that the synthetic event is in session history with correct format
-4. Verify `InterruptionHandlerPlugin` is in the App's plugins list
+4. Verify `AdkInterruptionPlugin` is in the App's plugins list
 5. Add logging to `before_model_callback()` to see filtering
 
 ## Dependencies
 
-- `pipecat-ai>=0.0.94`: Pipeline framework
+- `pipecat-ai>=0.0.102,<1.0.0`: Pipeline framework
 - `google-adk>=1.18.0`: Agent Development Kit
 - `google-genai>=1.51.0`: Generative AI SDK
 - `google-cloud-texttospeech>=2.33.0`: TTS

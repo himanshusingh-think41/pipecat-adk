@@ -47,6 +47,12 @@ from pipecat.frames.frames import (
 )
 from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMUserAggregatorParams,
+    UserTurnStrategies,
+)
+from pipecat.turns.user_start import VADUserTurnStartStrategy, TranscriptionUserTurnStartStrategy
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.services.stt_service import STTService
 from pipecat.services.tts_service import TTSService
 from pipecat.utils.time import time_now_iso8601
@@ -60,7 +66,7 @@ from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIPro
 
 from google.adk.sessions import InMemorySessionService
 from google.adk.apps import App
-from pipecat_adk import AdkBasedLLMService, AdkStateDeltaFrame, SessionParams
+from pipecat_adk import AdkBasedLLMService, SessionParams
 
 # Constants for mock services
 SILENCE = b'\x00'
@@ -217,38 +223,37 @@ class BotOutput:
 
     @property
     def transcript(self) -> List[Turn]:
-        """Chronological utterance list built from RTVI messages."""
+        """Chronological utterance list built from RTVI messages.
+
+        Uses bot-llm-started/text/stopped to track bot turns. This is more
+        reliable than bot-started/stopped-speaking for multi-sentence responses
+        because TTS audio contexts fire separate speaking events per sentence,
+        making it impossible to reconstruct full turn boundaries from audio signals.
+        """
         convo: List[Turn] = []
-        bot_buffer: List[str] = []
-        in_bot_turn = False
+        llm_buffer: List[str] = []
+        in_llm_turn = False
 
         for msg in self._messages:
             msg_type = msg.get("type")
             data = msg.get("data") or {}
 
-            if msg_type == "bot-started-speaking":
-                in_bot_turn = True
-                bot_buffer = []
-            elif msg_type == "bot-tts-text":
-                text = data.get("text", "")
-                if in_bot_turn:
-                    bot_buffer.append(text)
-                else:
+            if msg_type == "bot-llm-started":
+                in_llm_turn = True
+                llm_buffer = []
+            elif msg_type == "bot-llm-text" and in_llm_turn:
+                llm_buffer.append(data.get("text", ""))
+            elif msg_type == "bot-llm-stopped" and in_llm_turn:
+                text = "".join(llm_buffer)
+                if text:
                     convo.append(Turn(speaker="bot", text=text))
-            elif msg_type == "interruption" and in_bot_turn:
-                # Flush whatever the bot has said so far to capture partial speech
-                convo.append(Turn(speaker="bot", text=" ".join(bot_buffer)))
-                bot_buffer = []
-                in_bot_turn = False
-            elif msg_type == "bot-stopped-speaking" and in_bot_turn:
-                convo.append(Turn(speaker="bot", text=" ".join(bot_buffer)))
-                bot_buffer = []
-                in_bot_turn = False
+                llm_buffer = []
+                in_llm_turn = False
             elif msg_type == "user-transcription" and data.get("final"):
                 convo.append(Turn(speaker="user", text=data.get("text", "")))
 
-        if bot_buffer:
-            convo.append(Turn(speaker="bot", text=" ".join(bot_buffer)))
+        if in_llm_turn and llm_buffer:
+            convo.append(Turn(speaker="bot", text="".join(llm_buffer)))
 
         return convo
 
@@ -544,13 +549,29 @@ class TestRunner:
         self.mock_output = self.transport.output()
         self._bot_output = self.transport.bot_output()
 
-        # Create ADK service
+        # Create ADK service (extract agent and plugins from the App)
         self.adk_service = AdkBasedLLMService(
+            agent=app.root_agent,
             session_service=self.session_service,
             session_params=self.session_params,
-            app=app,
+            plugins=app.plugins,
         )
-        context_aggregators = self.adk_service.create_context_aggregator()
+        # Use MockVADAnalyzer + SpeechTimeoutUserTurnStopStrategy so tests don't
+        # load the LocalSmartTurnV3 ONNX model (which rejects mock audio buffers).
+        mock_vad = MockVADAnalyzer(sample_rate=INPUT_SAMPLE_RATE)
+        user_params = LLMUserAggregatorParams(
+            vad_analyzer=mock_vad,
+            user_turn_strategies=UserTurnStrategies(
+                start=[
+                    VADUserTurnStartStrategy(),
+                    TranscriptionUserTurnStartStrategy(),
+                ],
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.2)],
+            ),
+        )
+        context_aggregators = self.adk_service.create_context_aggregator(
+            user_params=user_params
+        )
 
         # Create RTVI processor for message serialization
         self._rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
@@ -918,7 +939,6 @@ class MockInputTransport(BaseInputTransport):
             audio_in_channels=NUM_CHANNELS,
             audio_in_stream_on_start=True,
             audio_in_passthrough=True,
-            vad_analyzer=MockVADAnalyzer(),
         )
         super().__init__(params=params, **kwargs)
         self._parent_transport: MockTransport = parent_transport
@@ -1094,7 +1114,7 @@ class MockTTSService(TTSService):
         )
         return audio_frame
 
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """
         Mocks the TTS process by encoding text to bytes in word-based chunks.
         """

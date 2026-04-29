@@ -82,7 +82,7 @@ The library uses an "accountant's approach" for interruptions:
 
 1. When user interrupts, the system tracks what was actually spoken
 2. A synthetic event is added to the ADK session with the partial response
-3. On the next user message, the InterruptionHandlerPlugin filters the conversation history
+3. On the next user message, the AdkInterruptionPlugin filters the conversation history
 4. The LLM only sees what the user actually heard, ensuring natural conversation flow
 
 ### Session Management

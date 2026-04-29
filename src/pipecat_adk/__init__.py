@@ -1,32 +1,30 @@
-from .context_aggregators import (
+from .aggregators import (
+    AdkAssistantContextAggregator,
     AdkContextAggregatorPair,
     AdkUserContextAggregator,
-    AdkAssistantContextAggregator,
 )
-from .frames import (
-    AdkAppendEventFrame,
-    AdkContextFrame,
-    AdkInvokeAgentFrame,
-    AdkStateDeltaFrame,
-)
-from .llm_service import AdkBasedLLMService
-from .plugin import InterruptionHandlerPlugin
+from .frames import AdkAudioContextCompletedFrame, AdkContextFrame
+from .interruption import AdkInterruptionPlugin
+from .service import AdkBasedLLMService
+from .tts_invocation import make_adk_aware_tts
 from .types import SessionParams
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
-    # Core types
-    "SessionParams",
+    # Core service
     "AdkBasedLLMService",
-    "InterruptionHandlerPlugin",
-    # Frames
-    "AdkContextFrame",
-    "AdkStateDeltaFrame",
-    "AdkAppendEventFrame",
-    "AdkInvokeAgentFrame",
     # Aggregators
-    "AdkContextAggregatorPair",
     "AdkUserContextAggregator",
     "AdkAssistantContextAggregator",
+    "AdkContextAggregatorPair",
+    # Frames
+    "AdkContextFrame",
+    "AdkAudioContextCompletedFrame",
+    # Plugin
+    "AdkInterruptionPlugin",
+    # TTS factory
+    "make_adk_aware_tts",
+    # Types
+    "SessionParams",
 ]

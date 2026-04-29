@@ -31,7 +31,7 @@ from pipecat.frames.frames import (
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 
 # Import ADK frames
-from pipecat_adk.frames import AdkContextFrame, AdkInvokeAgentFrame, AdkAppendEventFrame, AdkStateDeltaFrame
+from pipecat_adk.frames import AdkContextFrame, AdkAudioContextCompletedFrame
 
 
 class AdkDebugLogObserver(BaseObserver):
@@ -63,9 +63,7 @@ class AdkDebugLogObserver(BaseObserver):
         FunctionCallResultFrame: {"id", "function_name"},
         # ADK frames
         AdkContextFrame: {"id", "invocation_id"},
-        AdkInvokeAgentFrame: {"id"},
-        AdkAppendEventFrame: {"id"},
-        AdkStateDeltaFrame: {"id", "state_delta", "source"},
+        AdkAudioContextCompletedFrame: {"id", "context_id"},
     }
 
     # Frame types we care about logging
@@ -86,9 +84,7 @@ class AdkDebugLogObserver(BaseObserver):
         TTSTextFrame,
         # ADK frames
         AdkContextFrame,
-        AdkInvokeAgentFrame,
-        AdkAppendEventFrame,
-        AdkStateDeltaFrame,
+        AdkAudioContextCompletedFrame,
     }
 
     def __init__(
