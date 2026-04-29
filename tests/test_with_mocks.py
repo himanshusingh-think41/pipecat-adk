@@ -5,10 +5,12 @@ This test validates the full pipeline flow using MockLLM, MockSTTService,
 MockTTSService, and MockInputTransport/MockOutputTransport with RTVI.
 """
 
+import re
 import unittest
 
 from google.adk.agents import Agent
 from google.adk.apps import App
+from google.adk.tools import ToolContext
 from google.genai.types import Part
 from pipecat_adk import AdkInterruptionPlugin
 
@@ -254,6 +256,170 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
                 Turn("user", "Can you assist me?"),
                 Turn("bot", "Great, I'd be happy to assist with that."),
             ])
+
+
+class TestCriticalPaths(unittest.IsolatedAsyncioTestCase):
+    """Tests that verify the library's core correctness guarantees."""
+
+    def _make_app(self, mock_llm, *, tools=None) -> App:
+        agent = Agent(
+            name="test_agent",
+            model=mock_llm,
+            instruction="You are a helpful assistant.",
+            tools=tools or [],
+        )
+        return App(name="agents", root_agent=agent, plugins=[AdkInterruptionPlugin()])
+
+    async def test_rtvi_message_ordering(self):
+        """bot-tts-text must arrive between bot-started-speaking and bot-stopped-speaking.
+
+        The transcript builder in BotOutput relies on this ordering to attribute
+        text to the correct speaking turn. If bot-tts-text arrives outside the
+        started/stopped window, text would be lost or mis-attributed.
+        """
+        app = self._make_app(MockLLM.single("Hello world"))
+
+        async with TestRunner(app=app) as runner:
+            await runner.join()
+            # "Hello there" is long enough (>1 PCM sample) for MockVADAnalyzer to
+            # detect speech onset (start_secs=0.0001s at 16kHz ≈ 1.6 samples).
+            # Single-word speech like "Hi" (1 sample) would fall below the threshold.
+            await runner.speak_and_wait_for_response("Hello there", timeout=5.0)
+
+        types = [m.get("type") for m in runner.messages]
+
+        started_idx = types.index("bot-started-speaking")
+        stopped_idx = types.index("bot-stopped-speaking")
+        tts_text_indices = [i for i, t in enumerate(types) if t == "bot-tts-text"]
+
+        self.assertGreater(len(tts_text_indices), 0, "bot-tts-text message missing")
+        for idx in tts_text_indices:
+            self.assertGreater(
+                idx, started_idx,
+                f"bot-tts-text at {idx} must come after bot-started-speaking at {started_idx}",
+            )
+            self.assertLess(
+                idx, stopped_idx,
+                f"bot-tts-text at {idx} must come before bot-stopped-speaking at {stopped_idx}",
+            )
+
+    async def test_heard_event_contains_text_after_interruption(self):
+        """[HEARD] event written to ADK session must carry non-empty spoken text.
+
+        make_adk_aware_tts pushes AdkTTSSpeakingTextFrame before audio, so
+        AdkAssistantContextAggregator has the text in its buffer at the moment
+        the InterruptionFrame fires. This test verifies that chain end-to-end.
+        """
+        app = self._make_app(MockLLM.single(
+            "I'm about to tell you a very long story that goes on and on forever..."
+        ))
+
+        async with TestRunner(app=app, tts_delay=0.05) as runner:
+            await runner.join()
+            await runner.speak("Tell me something")
+            await runner.interrupt_bot("Stop!", timeout=5.0)
+
+            def _has_user_transcription(_bot_output, delta):
+                return any(
+                    m.get("type") == "user-transcription" and m.get("data", {}).get("final")
+                    for m in delta
+                )
+            await runner.wait_for(_has_user_transcription, timeout=5.0)
+
+        events = await runner.events()
+        heard_events = [
+            e for e in events
+            if (
+                hasattr(e, "content") and e.content and e.content.parts
+                and any("[HEARD]" in (getattr(p, "text", "") or "") for p in e.content.parts)
+            )
+        ]
+
+        self.assertGreater(len(heard_events), 0, "Expected at least one [HEARD] event in session")
+
+        for event in heard_events:
+            for part in event.content.parts:
+                text = getattr(part, "text", "") or ""
+                if "[HEARD]" not in text:
+                    continue
+                match = re.search(r'heard: "([^"]*)"', text)
+                self.assertIsNotNone(
+                    match, f"[HEARD] event text has unexpected format: {text!r}"
+                )
+                heard_text = match.group(1)
+                self.assertGreater(
+                    len(heard_text), 0,
+                    f"[HEARD] event has empty heard text: {text!r}",
+                )
+
+    async def test_no_heard_event_on_clean_turn(self):
+        """AdkAudioContextCompletedFrame must clear the context so no [HEARD] is written.
+
+        On a clean (uninterrupted) turn, make_adk_aware_tts fires
+        on_audio_context_completed, which pushes AdkAudioContextCompletedFrame.
+        AdkAssistantContextAggregator pops that context_id, so no [HEARD] event
+        is written even though AdkTTSSpeakingTextFrame was buffered.
+        """
+        app = self._make_app(MockLLM.single("I will answer your question completely."))
+
+        async with TestRunner(app=app) as runner:
+            await runner.join()
+            await runner.speak_and_wait_for_response("Tell me something", timeout=5.0)
+
+        events = await runner.events()
+        heard_events = [
+            e for e in events
+            if (
+                hasattr(e, "content") and e.content and e.content.parts
+                and any("[HEARD]" in (getattr(p, "text", "") or "") for p in e.content.parts)
+            )
+        ]
+
+        self.assertEqual(
+            len(heard_events), 0,
+            f"Expected no [HEARD] events on uninterrupted turn; found: {heard_events}",
+        )
+
+    async def test_session_state_persists_across_turns(self):
+        """Session state written by a tool in turn 1 is readable in turn 2.
+
+        ADK's InMemorySessionService persists tool_context.state mutations
+        across invocations. This test verifies pipecat-adk doesn't reset
+        or re-create the session between user turns.
+        """
+        def count_visits(tool_context: ToolContext) -> dict:
+            """Increment visit_count in session state and return the new value."""
+            current = tool_context.state.get("visit_count", 0) + 1
+            tool_context.state["visit_count"] = current
+            return {"visit_number": current}
+
+        # Each user turn triggers: function-call LLM response, then text LLM response.
+        mock_llm = MockLLM.from_parts([
+            [Part.from_function_call(name="count_visits", args={})],
+            "This is your first visit.",
+            [Part.from_function_call(name="count_visits", args={})],
+            "This is your second visit.",
+        ])
+
+        app = self._make_app(mock_llm, tools=[count_visits])
+
+        async with TestRunner(app=app) as runner:
+            await runner.join()
+            await runner.speak_and_wait_for_response("Hello", timeout=5.0)
+
+            state = await runner.session_state()
+            self.assertEqual(
+                state.get("visit_count"), 1,
+                f"visit_count should be 1 after turn 1; state={state}",
+            )
+
+            await runner.speak_and_wait_for_response("Hello again", timeout=5.0)
+
+            state = await runner.session_state()
+            self.assertEqual(
+                state.get("visit_count"), 2,
+                f"visit_count should be 2 after turn 2; state={state}",
+            )
 
 
 if __name__ == "__main__":
