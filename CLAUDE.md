@@ -1,307 +1,84 @@
 # CLAUDE.md
 
-Development guide for internal contributors to pipecat-adk.
+Development guide for pipecat-adk contributors.
 
-## Project Purpose
+## Why
 
-pipecat-adk integrates Google ADK agents with Pipecat pipelines for real-time voice AI. The core insight is that both frameworks excel at different things—Pipecat at real-time audio, ADK at agent logic—and combining them requires careful handling of the impedance mismatch between streaming audio and request/response patterns.
+[Pipecat](https://github.com/pipecat-ai/pipecat) owns real-time audio; [Google ADK](https://github.com/google/adk-python) owns agent logic. Neither was designed for the other. Pipecat's `LLMContext` accumulates messages in-process; ADK manages sessions as persistent event journals. The impedance mismatch means naive composition loses interruption correctness, tool-call auditability, and session persistence.
+
+This library swaps Pipecat's LLM service and context aggregators to route through ADK's `runner.run_async`, so ADK owns all conversation state while Pipecat handles audio. See [docs/architecture.md](docs/architecture.md).
 
 ## Development Commands
 
 ```bash
-# Setup
 uv sync
-
-# Run all tests
-uv run python -m unittest discover -s tests -v
-
-# Run specific test file
-uv run python -m unittest tests.test_with_mocks -v
-
-# Run specific test
-uv run python -m unittest tests.test_with_mocks.TestIntegration.test_basic_interaction -v
+uv run python -m unittest discover -s tests -v                              # all tests
+uv run python -m unittest tests.test_with_mocks -v                          # specific file
+uv run python -m unittest tests.test_with_mocks.TestWithMocks.test_basic_interaction -v
 ```
 
-## Architecture Overview
+## Source Map
 
-### Components
+| File | Key abstraction |
+|------|----------------|
+| `service.py` | `AdkBasedLLMService` — receives `AdkContextFrame`, calls `runner.run_async(invocation_id)`, converts ADK events to Pipecat frames |
+| `aggregators.py` | `AdkUserContextAggregator` — persists user event to ADK, pushes `AdkContextFrame`; `AdkAssistantContextAggregator` — tracks TTS text per `context_id`, writes `[HEARD]` on interruption |
+| `interruption.py` | `AdkInterruptionPlugin` — `before_model_callback` finds `[HEARD]` markers, truncates preceding model event, removes marker |
+| `tts_invocation.py` | `make_adk_aware_tts(base_class)` — class factory; wraps any `TTSService` to push `AdkAudioContextCompletedFrame` on `on_audio_context_completed` |
+| `frames.py` | `AdkContextFrame(invocation_id)`, `AdkAudioContextCompletedFrame(context_id)` |
+| `types.py` | `SessionParams(app_name, user_id, session_id)` |
 
-1. **SessionParams** (`types.py`): Session identification
-2. **AdkUserContextAggregator** (`aggregators.py`): Packages user input for ADK
-3. **AdkAssistantContextAggregator** (`aggregators.py`): Tracks spoken text, handles interruptions
-4. **AdkInterruptionPlugin** (`interruption.py`): Filters interrupted responses before LLM calls via `[HEARD]` markers
-5. **AdkBasedLLMService** (`service.py`): Main service replacing GoogleLLMService
-6. **Frame types** (`frames.py`): AdkContextFrame, AdkAudioContextCompletedFrame
+Extension points: `_build_user_event`, `_on_state_delta`, `_persist_and_run` — see [docs/architecture.md](docs/architecture.md).
 
-### Data Flow
+## Design Decisions
 
-```
-User speaks → STT → AdkUserContextAggregator → AdkBasedLLMService → ADK Runner
-                                                       ↓
-                    AdkAssistantContextAggregator ← TTS ← LLM response
-```
+### ADK owns context, not Pipecat
 
-## Design Decisions: The "Why"
+`AdkUserContextAggregator.push_aggregation` persists directly to ADK and skips `LLMContext` entirely (`super()` is not called). Consequence: Pipecat's ecosystem components that read `LLMContext` (`LLM Log Observer`, `Mem0`, `IVR Navigator`) won't see messages. Access history via `session_service.get_session()`.
 
-### Why ADK Manages Context, Not Pipecat
+### Accountant's approach to interruptions
 
-**Decision**: Clear Pipecat's context after each message (`self._context.set_messages([])`).
+ADK commits the full response immediately — audit trail preserved, tool calls survive. On interruption, `[HEARD]` events annotate what was actually spoken; `AdkInterruptionPlugin` rewrites the request at read-time. The alternative (buffer and only commit the spoken portion) loses tool calls mid-response and creates race conditions in streaming.
 
-**Why**: ADK provides sophisticated session management—persistence, state, multi-agent orchestration. Duplicating history in Pipecat would create synchronization bugs and prevent using ADK's features. The tradeoff is you can't use Pipecat's context inspection, but you get ADK's full session API.
+### [HEARD] is exact, not fuzzy
 
-### Why the "Accountant's Approach" to Interruptions
+Heard text is sourced directly from `TTSTextFrame.text` frames that passed through the pipeline — no difflib, no ASR re-comparison. `make_adk_aware_tts` signals clean completion via `AdkAudioContextCompletedFrame`; only interrupted contexts generate `[HEARD]` events.
 
-**Decision**: Let ADK commit the full response immediately, then filter it later.
+### Function call frames: both directions
 
-**Why we rejected buffering**: We considered buffering responses in memory and only committing the spoken portion. This seemed cleaner but had fatal flaws:
-- **Lost tool calls**: If the AI calls a tool mid-response and gets interrupted, we'd lose the tool execution entirely
-- **Session inconsistency**: ADK's session wouldn't reflect what actually happened
-- **Complexity**: Buffering in a streaming system creates subtle timing bugs
+`AdkBasedLLMService._handle_function_call` pushes `FunctionCallsStartedFrame` and `FunctionCallInProgressFrame` both `UPSTREAM` and `DOWNSTREAM`. Upstream: `STTMuteFilter` needs to mute mic during tool execution. Downstream: UI needs "thinking..." indicators.
 
-**Why the accountant's approach works**:
-- Events are committed as they happen (audit trail preserved)
-- Synthetic interruption events are just more events (natural extension)
-- Plugin filters at read-time, not write-time (simpler, no race conditions)
-- Tool calls are preserved even if the response is interrupted
+### Function call frames blocked from LLMContext
 
-The tradeoff is extra synthetic events in session history, but these are clearly marked and easy to filter for analytics.
+`AdkAssistantContextAggregator` no-ops `_handle_function_call_in_progress/result/cancel`. ADK manages tool calls internally in its session; letting those frames into `LLMContext` produces malformed context entries.
 
-### Why Fuzzy Matching for Interruptions
+## Testing
 
-**Decision**: Use substring matching with normalized text (lowercase, no punctuation, collapsed whitespace).
+End-to-end flows with mock services — no real API calls, no network. See **[tests/CLAUDE.md](tests/CLAUDE.md)** for the full guide (MockLLM, TestRunner DSL, wait strategies, gray-box inspection).
 
-**Why**: The AI's planned response and the actually-spoken text often differ slightly due to:
-- TTS services adding/removing punctuation
-- Streaming boundaries creating different chunk patterns
-- Minor text normalization differences
+**Quick orientation:**
 
-We tried exact matching first—it failed ~20% of the time in testing. Fuzzy matching with normalization handles these variations. The risk of false positives is very low because we're matching within the same conversation turn.
-
-### Why Push Function Call Frames Both Upstream and Downstream
-
-**Decision**: Push `FunctionCallInProgressFrame` etc. in both directions.
-
-**Why**: Different processors need to know about function calls:
-- **Upstream**: `STTMuteFilter` needs to mute the mic during tool execution
-- **Downstream**: UI needs to show "thinking..." indicators
-
-Pushing only downstream would leave upstream processors uninformed. Pushing both ensures all processors can react appropriately. The frames don't enter the LLM context (blocked by assistant aggregator), so there's no pollution.
-
-### Why Block Function Calls from Pipecat Context
-
-**Decision**: Assistant aggregator blocks `FunctionCallInProgressFrame` and related frames from entering context.
-
-**Why**: ADK manages tool calls internally. If we let these frames enter Pipecat's context, they'd create duplicate or malformed entries. The frames exist purely to inform other Pipecat processors of the lifecycle.
-
-### Why Synthetic Events Use `<interruption>` Tags
-
-**Decision**: Format is `<interruption>{spoken_text}</interruption>`.
-
-**Why**: We need the plugin to reliably find and parse these events. XML-style tags are:
-- Unambiguous (won't appear in natural speech)
-- Easy to parse with regex
-- Self-documenting in session history
-
-The exact format doesn't matter much—consistency does.
-
-## Testing Philosophy
-
-### End-to-End Over Unit Tests
-
-**Philosophy**: Test complete flows, not isolated components.
-
-**Why**: The interesting bugs in this library are integration bugs:
-- Interruption events not being created at the right time
-- Function call frames not reaching the right processors
-- State deltas not being emitted
-
-Unit tests for individual methods miss these. Our tests simulate complete user interactions using `TestRunner` and verify the end result.
-
-**Example of what we test**:
 ```python
-async def test_interruption_handling(self):
-    # Set up agent that will be interrupted
-    mock_llm = MockLLM.conversation([...])
-
-    async with TestRunner(app=app) as runner:
-        # User speaks, bot starts responding
-        # User interrupts mid-response
-        # Bot receives next message
-        # Verify bot only "remembers" what was actually spoken
+async with TestRunner(app=app) as runner:   # app = App(name="agents", ...)
+    await runner.join()
+    await runner.speak_and_wait_for_response("Hi")
+    assert runner.transcript == [Turn("user", "Hi"), Turn("bot", "Hello!")]
 ```
 
-This tests the full chain: user input → aggregator → service → ADK → plugin → response.
+| File | Coverage |
+|------|----------|
+| `test_with_mocks.py` | Integration flows: basic, interruption, function calls, multi-turn |
+| `test_plugin.py` | `AdkInterruptionPlugin` edge cases (12 tests) |
+| `test_utils.py` | `simplify_events()` |
 
-### Mock Infrastructure Design
+`TestRunner` accepts `app=App(name="agents", ...)` — app name must be `"agents"` to match the hardcoded session params inside `TestRunner`.
 
-**BotOutputTracker**: Shared state representing what the user sees/hears. Both input and output transports reference this to coordinate timing.
+## Gotchas
 
-**MockLLM**: Simulates Gemini's streaming behavior:
-- Streams text in chunks with `partial=True`
-- Sends final chunk with `partial=None`
-- Tracks requests for assertions
-- Supports function calls via `Part.from_function_call()`
-
-**MockInputTransport**: Executes a DSL of user actions:
-- `Say(text)`: Simulates user speaking
-- `WaitForResponse()`: Waits for bot to finish
-- `InterruptAfter(text, say)`: Waits for specific text then interrupts
-
-**MockSTTService/MockTTSService**: Convert frames symmetrically for testing. STT chunks input by words, TTS encodes text as fake audio.
-
-**TestRunner**: Orchestrates everything:
-- Creates pipeline with all mock services
-- Manages session lifecycle
-- Provides `simulate_user()` for running action sequences
-- Provides `events()` and `session_state()` for assertions
-
-### What Makes a Good Test
-
-1. **Test complete scenarios**: Don't test "can the aggregator handle an interruption frame"—test "when a user interrupts, does the next response only reference what was spoken?"
-
-2. **Use the DSL**: `Say()`, `WaitForResponse()`, `InterruptAfter()` make tests readable and express intent.
-
-3. **Assert on outcomes, not internals**: Check `response.said("expected")` or session state, not internal method calls.
-
-4. **One scenario per test**: Each test should have a clear "when X happens, Y should result" structure.
-
-5. **Use `simplify_events()`**: Convert ADK events to `[("user", "Hello"), ("agent", "Hi")]` for readable assertions.
-
-### Test Organization
-
-- `test_with_mocks.py`: Main integration tests using TestRunner
-- `test_plugin.py`: AdkInterruptionPlugin edge cases
-
-## Manual Testing
-
-### Running the Example Application
-
-```bash
-cd examples/assistant
-pip install -r requirements.txt
-pip install -e ../..  # Install pipecat-adk in development mode
-export GEMINI_API_KEY=your_key
-python run.py
-```
-
-Open http://localhost:7860 in your browser.
-
-### What to Test Manually
-
-1. **Basic conversation**: Say something, verify response makes sense
-2. **Interruptions**: Start speaking while the bot is talking—verify the bot acknowledges being interrupted and doesn't reference unspoken content
-3. **Multi-turn context**: Have a conversation, verify the bot remembers earlier turns
-4. **Long responses**: Ask for something verbose, interrupt mid-sentence
-
-### Debugging Tips
-
-**Enable debug logging**: The library uses `loguru`. Set environment variable or configure in code:
-```python
-from loguru import logger
-import sys
-logger.add(sys.stderr, level="DEBUG")
-```
-
-**Check session history**: Add this to see what ADK recorded:
-```python
-session = await session_service.get_session(
-    app_name=session_params.app_name,
-    user_id=session_params.user_id,
-    session_id=session_params.session_id
-)
-for event in session.events:
-    print(f"{event.author}: {event.content}")
-```
-
-**Check interruption events**: Look for `[HEARD]` markers in session history to verify the aggregator is creating them correctly.
-
-**Check plugin filtering**: Add logging to `AdkInterruptionPlugin.before_model_callback()` to see what it's filtering.
-
-## Code Patterns
-
-### Agent Names
-
-ADK requires underscores: `name="my_agent"` not `name="my-agent"`.
-
-### Frame Direction
-
-Always push function call frames both ways:
-```python
-await self.push_frame(frame, FrameDirection.UPSTREAM)
-await self.push_frame(frame, FrameDirection.DOWNSTREAM)
-```
-
-### Session Mocking
-
-When mocking ADK sessions in tests:
-```python
-session = MagicMock(spec=Session)
-session.events = []
-session._events = []  # Internal attribute ADK uses
-```
-
-### Test Isolation
-
-Use unique session IDs per test:
-```python
-session_id=f"test_session_{uuid.uuid4().hex[:8]}"
-```
-
-## Common Tasks
-
-### Adding a New Frame Type
-
-1. Define in `frames.py`:
-```python
-@dataclass
-class MyNewFrame(DataFrame):
-    my_field: str
-```
-
-2. Export in `__init__.py`
-
-3. Handle in `AdkBasedLLMService.process_frame()`:
-```python
-if isinstance(frame, MyNewFrame):
-    await self._handle_my_frame(frame)
-```
-
-4. Add tests in `test_state_sync.py` or new test file
-
-### Adding an Extension Point
-
-1. Add method with default implementation:
-```python
-async def my_extension_point(self):
-    """Override this to customize behavior.
-
-    Example:
-        class MyAggregator(AdkUserContextAggregator):
-            async def my_extension_point(self):
-                return custom_value
-    """
-    return default_value
-```
-
-2. Call it where needed
-
-3. Add tests for both default and overridden behavior
-
-### Debugging Interruptions
-
-1. Check that `AdkAssistantContextAggregator._handle_interruptions()` is being called
-2. Verify the aggregator has accumulated text (it uses Pipecat's built-in tracking)
-3. Check that the synthetic event is in session history with correct format
-4. Verify `AdkInterruptionPlugin` is in the App's plugins list
-5. Add logging to `before_model_callback()` to see filtering
+- ADK agent names require underscores: `name="my_agent"` not `name="my-agent"`
+- `AdkBasedLLMService` creates the `App` and `Runner` internally — pass `agent` + `plugins`, not an `App`
+- `make_adk_aware_tts` must wrap the TTS class; without it, completed audio contexts are never cleared from the `[HEARD]` buffer
 
 ## Dependencies
 
-- `pipecat-ai>=0.0.102,<1.0.0`: Pipeline framework
-- `google-adk>=1.18.0`: Agent Development Kit
-- `google-genai>=1.51.0`: Generative AI SDK
-- `google-cloud-texttospeech>=2.33.0`: TTS
-- `google-cloud-speech>=2.34.0`: STT
-- `loguru>=0.7.3`: Logging
-
-No dev dependencies—uses Python's built-in `unittest`.
+See [`pyproject.toml`](pyproject.toml). Key: `pipecat-ai>=0.0.102,<1.0.0`, `google-adk>=1.18.0`.
