@@ -1,12 +1,14 @@
-"""
-Concise frame observer for pipecat-adk pipeline debugging.
+"""Concise frame observer for pipecat-adk pipeline debugging.
 
-Logs frame activity at INFO level with minimal verbosity.
-Format: FrameName field=value field2=value2
+Logs each significant frame exactly once (at the point it leaves its origin
+service) at INFO level. Format: FrameName field=value ...  (src -> dst)
+
+Uses source-based filtering (frame_type → (source_class, FrameEndpoint)) so
+the same frame is not logged redundantly at every pipeline hop.
 """
 
 from dataclasses import fields, is_dataclass
-from typing import Dict, Optional, Set, Type
+from typing import Dict, Optional, Set, Tuple, Type
 
 from google.adk.events import Event
 from loguru import logger
@@ -15,6 +17,9 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
+    FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
+    FunctionCallsStartedFrame,
     InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -25,94 +30,125 @@ from pipecat.frames.frames import (
     TTSTextFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
-    FunctionCallInProgressFrame,
-    FunctionCallResultFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
+from pipecat.observers.loggers.debug_log_observer import FrameEndpoint
+from pipecat.services.llm_service import LLMService
+from pipecat.services.stt_service import STTService
+from pipecat.services.tts_service import TTSService
+from pipecat.transports.base_input import BaseInputTransport
+from pipecat.transports.base_output import BaseOutputTransport
 
-# Import ADK frames
-from pipecat_adk.frames import AdkContextFrame, AdkAudioContextCompletedFrame
+from pipecat_adk.frames import AdkAudioContextCompletedFrame, AdkContextFrame
+
+
+# Fields whose values should never appear in logs (binary data, internals).
+_EXCLUDE_FIELDS: Set[str] = {"audio", "image", "images", "name", "pts", "metadata"}
+
+# Per-frame allowlist: only these fields are logged for the given frame type.
+# Subclasses must come BEFORE their parent class in dict ordering so that the
+# first isinstance() match wins.
+_FIELD_ALLOWLIST: Dict[Type[Frame], Set[str]] = {
+    StartFrame: {"id"},
+    UserStartedSpeakingFrame: {"id"},
+    UserStoppedSpeakingFrame: {"id"},
+    BotStartedSpeakingFrame: {"id"},
+    BotStoppedSpeakingFrame: {"id"},
+    StartInterruptionFrame: {"id"},
+    InterruptionFrame: {"id"},
+    LLMFullResponseStartFrame: {"id"},
+    LLMFullResponseEndFrame: {"id"},
+    TranscriptionFrame: {"id", "text"},
+    TTSTextFrame: {"id", "text"},
+    FunctionCallsStartedFrame: {"id"},
+    FunctionCallInProgressFrame: {"id", "function_name"},
+    FunctionCallResultFrame: {"id", "function_name"},
+    # ADK-specific frames — include invocation_id for log correlation.
+    AdkContextFrame: {"id", "invocation_id"},
+    AdkAudioContextCompletedFrame: {"id", "context_id"},
+    # LLMTextFrame after AdkContextFrame so the dict entry matches first.
+    LLMTextFrame: {"id", "text"},
+}
+
+# Default set of frame types to observe, each with an optional source filter.
+# None means "log regardless of source". (source_type, FrameEndpoint.SOURCE)
+# means "only log when the frame exits that source type".
+_DEFAULT_FRAME_FILTERS: Dict[Type[Frame], Optional[Tuple[Type, FrameEndpoint]]] = {
+    StartFrame: None,
+    # VAD / speaking events
+    UserStartedSpeakingFrame: (BaseInputTransport, FrameEndpoint.SOURCE),
+    UserStoppedSpeakingFrame: (BaseInputTransport, FrameEndpoint.SOURCE),
+    BotStartedSpeakingFrame: (BaseOutputTransport, FrameEndpoint.SOURCE),
+    BotStoppedSpeakingFrame: (BaseOutputTransport, FrameEndpoint.SOURCE),
+    # Interruptions
+    StartInterruptionFrame: (BaseInputTransport, FrameEndpoint.SOURCE),
+    InterruptionFrame: (BaseInputTransport, FrameEndpoint.SOURCE),
+    # STT
+    TranscriptionFrame: (STTService, FrameEndpoint.SOURCE),
+    # LLM
+    LLMTextFrame: (LLMService, FrameEndpoint.SOURCE),
+    LLMFullResponseStartFrame: (LLMService, FrameEndpoint.SOURCE),
+    LLMFullResponseEndFrame: (LLMService, FrameEndpoint.SOURCE),
+    FunctionCallsStartedFrame: (LLMService, FrameEndpoint.SOURCE),
+    FunctionCallInProgressFrame: (LLMService, FrameEndpoint.SOURCE),
+    FunctionCallResultFrame: (LLMService, FrameEndpoint.SOURCE),
+    # ADK frames
+    AdkContextFrame: None,  # log from any source (injected at various points)
+    AdkAudioContextCompletedFrame: (TTSService, FrameEndpoint.SOURCE),
+    # TTS
+    TTSTextFrame: (TTSService, FrameEndpoint.SOURCE),
+}
 
 
 class AdkDebugLogObserver(BaseObserver):
+    """Concise INFO-level observer for pipecat-adk pipeline debugging.
+
+    Each frame type is logged exactly once — when it exits the designated
+    source processor. ADK Event objects are formatted compactly.
+
+    Usage::
+
+        observers=[RTVIObserver(rtvi), AdkDebugLogObserver()]
+
+    To log additional or different frame types::
+
+        from pipecat.observers.loggers.debug_log_observer import FrameEndpoint
+        observers=[AdkDebugLogObserver(frame_filters={
+            MyCustomFrame: (MyService, FrameEndpoint.SOURCE),
+            SomeOtherFrame: None,  # log from any source
+        })]
     """
-    Concise frame observer for pipecat-adk pipeline debugging.
-
-    Logs frame activity at INFO level with minimal verbosity.
-    Format: FrameName field=value field2=value2
-    """
-
-    # Fields to exclude from logging (binary data, internal fields)
-    EXCLUDE_FIELDS = {"audio", "image", "images", "name", "pts", "metadata"}
-
-    # Frame types that should only log specific fields (empty set = no fields)
-    FRAME_FIELD_ALLOWLIST: Dict[Type[Frame], Set[str]] = {
-        StartFrame: {"id"},
-        UserStartedSpeakingFrame: {"id"},
-        UserStoppedSpeakingFrame: {"id"},
-        BotStartedSpeakingFrame: {"id"},
-        BotStoppedSpeakingFrame: {"id"},
-        StartInterruptionFrame: {"id"},
-        InterruptionFrame: {"id"},
-        LLMFullResponseStartFrame: {"id"},
-        LLMFullResponseEndFrame: {"id"},
-        TranscriptionFrame: {"id", "text"},
-        LLMTextFrame: {"id", "text"},
-        TTSTextFrame: {"id", "text"},
-        FunctionCallInProgressFrame: {"id", "function_name"},
-        FunctionCallResultFrame: {"id", "function_name"},
-        # ADK frames
-        AdkContextFrame: {"id", "invocation_id"},
-        AdkAudioContextCompletedFrame: {"id", "context_id"},
-    }
-
-    # Frame types we care about logging
-    DEFAULT_FRAME_TYPES: Set[Type[Frame]] = {
-        StartFrame,
-        UserStartedSpeakingFrame,
-        UserStoppedSpeakingFrame,
-        BotStartedSpeakingFrame,
-        BotStoppedSpeakingFrame,
-        TranscriptionFrame,
-        StartInterruptionFrame,
-        InterruptionFrame,
-        LLMTextFrame,
-        LLMFullResponseStartFrame,
-        LLMFullResponseEndFrame,
-        FunctionCallInProgressFrame,
-        FunctionCallResultFrame,
-        TTSTextFrame,
-        # ADK frames
-        AdkContextFrame,
-        AdkAudioContextCompletedFrame,
-    }
 
     def __init__(
         self,
-        frame_types: Optional[Set[Type[Frame]]] = None,
+        frame_filters: Optional[Dict[Type[Frame], Optional[Tuple[Type, FrameEndpoint]]]] = None,
         **kwargs,
     ):
-        """
-        Initialize the observer.
-
-        Args:
-            frame_types: Set of frame types to log. If None, uses DEFAULT_FRAME_TYPES.
-        """
         super().__init__(**kwargs)
-        self.frame_types = frame_types if frame_types is not None else self.DEFAULT_FRAME_TYPES
-        self._seen_frames: Set[int] = set()  # Track frame IDs to avoid duplicate logging
+        self.frame_filters = frame_filters if frame_filters is not None else _DEFAULT_FRAME_FILTERS
 
-    def _get_frame_name(self, frame) -> str:
-        """Get display name for a frame type."""
-        return frame.__class__.__name__
+    # ── Filtering ────────────────────────────────────────────────────────────
+
+    def _should_log(self, frame: Frame, src, dst) -> bool:
+        for frame_type, filter_cfg in self.frame_filters.items():
+            if isinstance(frame, frame_type):
+                if filter_cfg is None:
+                    return True
+                service_type, endpoint = filter_cfg
+                if endpoint == FrameEndpoint.SOURCE:
+                    return isinstance(src, service_type)
+                if endpoint == FrameEndpoint.DESTINATION:
+                    return isinstance(dst, service_type)
+        return False
+
+    # ── Formatting ───────────────────────────────────────────────────────────
 
     def _format_value(self, value) -> str:
-        """Format a value concisely for logging."""
         if value is None:
             return "None"
-        elif isinstance(value, Event):
+        if isinstance(value, Event):
             return self._format_event(value)
-        elif isinstance(value, list):
+        if isinstance(value, list):
             if not value:
                 return "[]"
             if isinstance(value[0], Event):
@@ -120,117 +156,75 @@ class AdkDebugLogObserver(BaseObserver):
             if len(value) > 3:
                 return f"[{len(value)} items]"
             return str(value)
-        elif isinstance(value, str):
-            # Truncate long strings
-            if len(value) > 200:
-                return f"'{value[:197]}...'"
-            return f"'{value}'"
-        elif isinstance(value, (bytes, bytearray)):
+        if isinstance(value, str):
+            return f"'{value[:197]}...'" if len(value) > 200 else f"'{value}'"
+        if isinstance(value, (bytes, bytearray)):
             return f"{len(value)}B"
-        elif isinstance(value, dict):
-            # For dicts, show type key if present, otherwise just count
-            if "type" in value:
-                return f"{{{value['type']}}}"
-            return f"{{{len(value)} keys}}"
-        else:
-            result = str(value)
-            if len(result) > 200:
-                return result[:197] + "..."
-            return result
+        if isinstance(value, dict):
+            return f"{{{value['type']}}}" if "type" in value else f"{{{len(value)} keys}}"
+        result = str(value)
+        return result[:197] + "..." if len(result) > 200 else result
 
     def _format_event(self, event: Event) -> str:
-        """Format an ADK Event object compactly."""
         parts = []
-
         if event.partial:
             parts.append("partial")
-
         if event.content and event.content.parts:
-            text_parts = []
-            function_calls = []
-            function_responses = []
-
-            for part in event.content.parts:
-                if hasattr(part, 'text') and part.text:
-                    text_parts.append(part.text)
-                if hasattr(part, 'function_call') and part.function_call:
-                    function_calls.append(part.function_call.name)
-                if hasattr(part, 'function_response') and part.function_response:
-                    function_responses.append(part.function_response.name)
-
-            if text_parts:
-                combined_text = "".join(text_parts)
-                if len(combined_text) > 60:
-                    combined_text = combined_text[:57] + "..."
-                parts.append(f"'{combined_text}'")
-
-            if function_calls:
-                parts.append(f"fn={function_calls}")
-
-            if function_responses:
-                parts.append(f"resp={function_responses}")
-
+            texts, fn_calls, fn_resps = [], [], []
+            for p in event.content.parts:
+                if getattr(p, "text", None):
+                    texts.append(p.text)
+                if getattr(p, "function_call", None):
+                    fn_calls.append(p.function_call.name)
+                if getattr(p, "function_response", None):
+                    fn_resps.append(p.function_response.name)
+            if texts:
+                t = "".join(texts)
+                parts.append(f"'{t[:57]}...'" if len(t) > 60 else f"'{t}'")
+            if fn_calls:
+                parts.append(f"fn={fn_calls}")
+            if fn_resps:
+                parts.append(f"resp={fn_resps}")
         return f"Event({', '.join(parts)})" if parts else "Event()"
 
-    def _should_log_frame(self, frame) -> bool:
-        """Check if frame type is in our list."""
-        for frame_type in self.frame_types:
+    def _extract_details(self, frame: Frame) -> str:
+        allowlist: Optional[Set[str]] = None
+        for frame_type, allowed in _FIELD_ALLOWLIST.items():
             if isinstance(frame, frame_type):
-                return True
-        return False
-
-    def _extract_frame_details(self, frame) -> str:
-        """Extract relevant fields from a frame as a concise string."""
-        details = []
-
-        # Check if this frame type has an allowlist
-        allowlist = None
-        for frame_type, allowed_fields in self.FRAME_FIELD_ALLOWLIST.items():
-            if isinstance(frame, frame_type):
-                allowlist = allowed_fields
+                allowlist = allowed
                 break
 
-        if is_dataclass(frame):
-            for field in fields(frame):
-                if field.name in self.EXCLUDE_FIELDS:
-                    continue
-                # If allowlist exists, only include fields in allowlist
-                if allowlist is not None and field.name not in allowlist:
-                    continue
-                value = getattr(frame, field.name)
-                if value is None:
-                    continue
-                formatted = self._format_value(value)
-                details.append(f"{field.name}={formatted}")
+        if not is_dataclass(frame):
+            return ""
 
-        return " ".join(details)
+        parts = []
+        for field in fields(frame):
+            if field.name in _EXCLUDE_FIELDS:
+                continue
+            if allowlist is not None and field.name not in allowlist:
+                continue
+            value = getattr(frame, field.name)
+            if value is None:
+                continue
+            parts.append(f"{field.name}={self._format_value(value)}")
+        return " ".join(parts)
+
+    # ── Observer hook ────────────────────────────────────────────────────────
 
     async def on_push_frame(self, data: FramePushed):
-        """Log frame push events at INFO level."""
         frame = data.frame
-        source = data.source
-        destination = data.destination
+        src = data.source
+        dst = data.destination
 
-        if not self._should_log_frame(frame):
+        if not self._should_log(frame, src, dst):
             return
 
-        # For StartFrame, log every push to trace propagation
-        # For other frames, deduplicate by frame ID
-        frame_id = getattr(frame, 'id', None)
-        if not isinstance(frame, StartFrame) and frame_id is not None:
-            if frame_id in self._seen_frames:
-                return
-            self._seen_frames.add(frame_id)
+        name = frame.__class__.__name__
+        details = self._extract_details(frame)
+        src_name = src.name if src else "?"
+        dst_name = dst.name if dst else "?"
 
-        frame_name = self._get_frame_name(frame)
-        details = self._extract_frame_details(frame)
-
-        # Include source -> destination for StartFrame to trace propagation
-        src_name = source.name if source else "?"
-        dst_name = destination.name if destination else "?"
-
-        # Concise format: FrameName details
         if details:
-            logger.info(f"{frame_name} {details} ({src_name} -> {dst_name})")
+            logger.info(f"{name} {details}  ({src_name} -> {dst_name})")
         else:
-            logger.info(f"{frame_name} ({src_name} -> {dst_name})")
+            logger.info(f"{name}  ({src_name} -> {dst_name})")

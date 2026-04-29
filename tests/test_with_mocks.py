@@ -51,7 +51,6 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
 
     async def test_interruption_handling(self):
         """Test that user can interrupt bot's response."""
-        # Bot will give a long response that gets interrupted
         mock_llm = MockLLM.single(
             "Hello! I'm so glad you're interested in learning about our company. "
             "We have a very long history that spans over 50 years, and we've been "
@@ -72,28 +71,25 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
 
         async with TestRunner(app=app, tts_delay=0.05) as runner:
             await runner.join()
-            # User speaks to trigger bot response
             await runner.speak("Tell me about your company")
-            # Interrupt the bot while it's speaking
+            # interrupt_bot waits for bot-started-speaking, then injects speech.
             await runner.interrupt_bot("Wait, I have a question", timeout=5.0)
 
-            # Wait for interruption to be processed by checking for user transcription
+            # Wait for the interruption transcription to arrive.
             def _has_interruption_transcription(bot_output, delta_messages):
                 return any(
-                    msg.get("type") == "user-transcription" and
-                    msg.get("data", {}).get("final") and
-                    "question" in msg.get("data", {}).get("text", "").lower()
+                    msg.get("type") == "user-transcription"
+                    and msg.get("data", {}).get("final")
+                    and "question" in msg.get("data", {}).get("text", "").lower()
                     for msg in delta_messages
                 )
             await runner.wait_for(_has_interruption_transcription, timeout=5.0)
 
-            # Verify the session has recorded some conversation
             events = await runner.events()
             self.assertGreater(len(events), 0, "Should have events in session")
 
-            # Verify we have at least a user message in the session
             has_user_message = any(
-                hasattr(e, 'content') and e.content and e.content.role == 'user'
+                hasattr(e, "content") and e.content and e.content.role == "user"
                 for e in events
             )
             self.assertTrue(has_user_message, "Should have at least one user message in session")
