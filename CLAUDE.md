@@ -47,6 +47,10 @@ Heard text is sourced directly from `TTSTextFrame.text` frames that passed throu
 
 `AdkBasedLLMService._handle_function_call` pushes `FunctionCallsStartedFrame` and `FunctionCallInProgressFrame` both `UPSTREAM` and `DOWNSTREAM`. Upstream: `STTMuteFilter` needs to mute mic during tool execution. Downstream: UI needs "thinking..." indicators.
 
+### Pre-persisting user events and ResumabilityConfig
+
+We persist the user event to ADK *before* calling `runner.run_async`, then resume via `invocation_id` — this enables `_build_user_event` to enrich events with contextual data before they enter the session journal, and requires `ResumabilityConfig(is_resumable=True)` which ADK enforces as a hard constraint. See [docs/invocation-id-and-resumability.md](docs/invocation-id-and-resumability.md).
+
 ### Function call frames blocked from LLMContext
 
 `AdkAssistantContextAggregator` no-ops `_handle_function_call_in_progress/result/cancel`. ADK manages tool calls internally in its session; letting those frames into `LLMContext` produces malformed context entries.
