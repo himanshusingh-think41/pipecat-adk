@@ -4,7 +4,7 @@ This module defines the ADK App with the root agent and plugins.
 """
 
 from google.adk.agents import Agent
-from google.adk.apps.app import App
+from google.adk.apps.app import App, ResumabilityConfig
 from pipecat_adk import AdkInterruptionPlugin
 
 
@@ -26,9 +26,11 @@ root_agent = Agent(
     instruction=SYSTEM_INSTRUCTION,
 )
 
-# Create ADK App with AdkInterruptionPlugin for proper interruption handling
+# ResumabilityConfig is required by AdkBasedLLMService — it pre-persists user
+# events and resumes via invocation_id, which ADK only allows on resumable apps.
 app = App(
     name="assistant",
     root_agent=root_agent,
     plugins=[AdkInterruptionPlugin()],
+    resumability_config=ResumabilityConfig(is_resumable=True),
 )

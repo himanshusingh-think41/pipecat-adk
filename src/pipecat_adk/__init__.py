@@ -3,7 +3,6 @@ from .aggregators import (
     AdkContextAggregatorPair,
     AdkUserContextAggregator,
 )
-from .frames import AdkContextFrame
 from .interruption import AdkInterruptionPlugin
 from .service import AdkBasedLLMService
 from .types import SessionParams
@@ -17,8 +16,6 @@ __all__ = [
     "AdkUserContextAggregator",
     "AdkAssistantContextAggregator",
     "AdkContextAggregatorPair",
-    # Frames
-    "AdkContextFrame",
     # Plugin
     "AdkInterruptionPlugin",
     # Types

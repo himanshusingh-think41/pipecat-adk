@@ -54,12 +54,12 @@ async def run_bot(webrtc_connection):
     )
     await session_service.create_session(**session_params.model_dump())
 
-    # Create ADK-based LLM service with the app from agent.py
-    # The app includes the agent and AdkInterruptionPlugin
+    # Create ADK-based LLM service with the app from agent.py.
+    # app already has ResumabilityConfig set — required by AdkBasedLLMService.
     llm = AdkBasedLLMService(
         session_service=session_service,
         session_params=session_params,
-        app=app
+        app=app,
     )
 
     # Create context aggregators

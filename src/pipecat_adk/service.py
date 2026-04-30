@@ -4,7 +4,7 @@ Replaces the standard LLM API call with Google ADK's runner.run_async,
 bridging ADK's session-based agent invocations into Pipecat's frame pipeline.
 """
 
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from google.adk.agents import BaseAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
@@ -45,57 +45,84 @@ from .types import SessionParams
 class AdkBasedLLMService(LLMService):
     """LLM service that drives a Google ADK agent instead of a direct LLM call.
 
-    Creates an ADK App and Runner internally. Receives AdkContextFrame from
-    AdkUserContextAggregator (the user event has already been persisted) and
-    calls runner.run_async(invocation_id=...) to resume the invocation.
+    Receives AdkContextFrame from AdkUserContextAggregator (the user event has
+    already been persisted) and calls runner.run_async(invocation_id=...) to
+    resume the invocation.
+
+    Can be constructed two ways:
+
+    1. Pass an ``App`` directly — full control over ADK App config::
+
+        llm = AdkBasedLLMService(
+            app=app,
+            session_service=session_service,
+            session_params=session_params,
+        )
+
+    2. Pass ``agent`` + optional ``plugins`` — the App is built internally::
+
+        llm = AdkBasedLLMService(
+            agent=agent,
+            plugins=[AdkInterruptionPlugin()],
+            session_service=session_service,
+            session_params=session_params,
+        )
+
+    Either way, the App must have ``ResumabilityConfig(is_resumable=True)``; the
+    service validates this and raises ``ValueError`` if it is missing.
 
     Extension points for subclasses:
     - _on_state_delta(state_delta): called for every ADK event that carries state
     - _persist_and_run(content, state_delta): inject a system event and run the agent
     - process_frame: handle domain-specific frames by calling _persist_and_run
-
-    Example::
-
-        class MyLLMService(AdkBasedLLMService):
-            async def _on_state_delta(self, state_delta: dict) -> None:
-                await self.push_frame(RTVIServerMessageFrame(...))
-
-            async def process_frame(self, frame, direction):
-                if isinstance(frame, MyDomainFrame):
-                    await self._persist_and_run(
-                        content=Content(role="user", parts=[Part(text="...")])
-                    )
-                else:
-                    await super().process_frame(frame, direction)
     """
 
     def __init__(
         self,
-        agent: BaseAgent,
         session_service: BaseSessionService,
         session_params: SessionParams,
+        app: Optional[App] = None,
+        agent: Optional[BaseAgent] = None,
         plugins: Optional[list] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the ADK-based LLM service.
 
+        Provide either ``app`` or ``agent`` (not both).
+
         Args:
-            agent: The root ADK agent to run.
             session_service: ADK session service (must already have the session created).
             session_params: Session identification (app_name, user_id, session_id).
-            plugins: Optional list of ADK plugins (e.g. AdkInterruptionPlugin).
+            app: A pre-built ADK App. Must have ResumabilityConfig(is_resumable=True).
+            agent: The root ADK agent. Mutually exclusive with ``app``.
+            plugins: ADK plugins (e.g. AdkInterruptionPlugin). Only used when
+                building the App from ``agent``; ignored when ``app`` is provided.
             **kwargs: Additional keyword arguments passed to LLMService.
         """
         super().__init__(**kwargs)
         self.session_service = session_service
         self.session_params = session_params
 
-        app = App(
-            name=session_params.app_name,
-            root_agent=agent,
-            resumability_config=ResumabilityConfig(is_resumable=True),
-            plugins=plugins or [],
-        )
+        if app is not None and agent is not None:
+            raise ValueError("Provide either 'app' or 'agent', not both.")
+        if app is None and agent is None:
+            raise ValueError("Either 'app' or 'agent' must be provided.")
+
+        if app is None:
+            app = App(
+                name=session_params.app_name,
+                root_agent=agent,
+                resumability_config=ResumabilityConfig(is_resumable=True),
+                plugins=plugins or [],
+            )
+        else:
+            if not (app.resumability_config and app.resumability_config.is_resumable):
+                raise ValueError(
+                    "The App passed to AdkBasedLLMService must have "
+                    "ResumabilityConfig(is_resumable=True). "
+                    "See docs/invocation-id-and-resumability.md for why this is required."
+                )
+
         self.runner = Runner(app=app, session_service=session_service)
 
     def create_context_aggregator(

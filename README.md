@@ -53,42 +53,46 @@ pipeline = Pipeline([
 ### After (With pipecat-adk)
 
 ```python
-from pipecat_adk import AdkBasedLLMService, AdkInterruptionPlugin, SessionParams, make_adk_aware_tts
+from pipecat_adk import AdkBasedLLMService, AdkInterruptionPlugin, SessionParams
 from google.adk.agents import Agent
+from google.adk.apps.app import App, ResumabilityConfig
 from google.adk.sessions import InMemorySessionService
 from pipecat.services.google.tts import GoogleTTSService
 from pipecat.pipeline.pipeline import Pipeline
 
-# 1. Define your ADK agent
+# 1. Define your ADK agent and App
 agent = Agent(
     name="helpful_assistant",  # Note: use underscores, not hyphens
     model="gemini-2.0-flash",
     instruction="You are a helpful assistant.",
 )
+app = App(
+    name="my_app",
+    root_agent=agent,
+    plugins=[AdkInterruptionPlugin()],
+    resumability_config=ResumabilityConfig(is_resumable=True),
+)
 
 # 2. Set up session management
 session_service = InMemorySessionService()
 session_params = SessionParams(
-    app_name="my_app",
+    app_name=app.name,
     user_id="user_123",
     session_id="session_456",
 )
 await session_service.create_session(**session_params.model_dump())
 
-# 3. Create the LLM service (manages the ADK App internally)
+# 3. Create the LLM service
 llm = AdkBasedLLMService(
-    agent=agent,
+    app=app,
     session_service=session_service,
     session_params=session_params,
-    plugins=[AdkInterruptionPlugin()],
 )
 
-# 4. Wrap TTS for accurate interruption tracking
-AdkAwareTTS = make_adk_aware_tts(GoogleTTSService)
-tts = AdkAwareTTS(voice_id=...)
-
-# 5. Create context aggregators — pipeline structure stays the same
+# 4. Create context aggregators — pipeline structure stays the same
 context_aggregator = llm.create_context_aggregator()
+
+tts = GoogleTTSService(voice_id=...)
 
 pipeline = Pipeline([
     transport.input(),
@@ -101,7 +105,7 @@ pipeline = Pipeline([
 ])
 ```
 
-The pipeline structure stays the same—you swap the LLM service, context aggregator, and TTS wrapper.
+The pipeline structure stays the same—you swap the LLM service and context aggregator.
 
 ## Key Challenges Solved
 
@@ -142,7 +146,7 @@ Every event is persisted automatically. You get full conversation history across
 
 The LLM sees only what the user actually heard. The full response remains in ADK session history for auditing.
 
-**Tradeoff**: The session history contains `[HEARD]` marker events. If you analyze raw session data you'll need to filter these. The `make_adk_aware_tts` factory must be used to wrap your TTS service—this signals when audio contexts complete cleanly (no `[HEARD]` needed), keeping the tracking buffer accurate.
+**Tradeoff**: The session history contains `[HEARD]` marker events. If you analyze raw session data you'll need to filter these.
 
 ### 4. State Management
 
@@ -239,7 +243,7 @@ Standard Pipecat components expect to read/write messages via `OpenAILLMContext`
 
 These Pipecat components work normally with pipecat-adk:
 - **STT services** (Google, Deepgram, etc.)
-- **TTS services** (Google, ElevenLabs, Cartesia, etc.) — wrap with `make_adk_aware_tts`
+- **TTS services** (Google, ElevenLabs, Cartesia, etc.)
 - **VAD analyzers** (Silero, WebRTC)
 - **Transports** (WebRTC, WebSocket)
 - **STTMuteFilter** (receives function call lifecycle frames)
@@ -376,13 +380,9 @@ simplified = simplify_events(events)
 
 ### Core Classes
 
-- **`AdkBasedLLMService(agent, session_service, session_params, plugins=[])`**: Main LLM service. Creates the ADK App and Runner internally. Override `_on_state_delta(state_delta)` to forward state to clients, and `process_frame` + `_persist_and_run(content, state_delta)` to inject system events.
-- **`SessionParams(app_name, user_id, session_id)`**: Dataclass for session identification.
-- **`AdkInterruptionPlugin`**: ADK plugin for deterministic interruption handling. Pass in `plugins=[AdkInterruptionPlugin()]` when creating the service.
-
-### TTS Factory
-
-- **`make_adk_aware_tts(base_class)`**: Wraps any `TTSService` subclass to push `AdkAudioContextCompletedFrame` when an audio context plays to completion. Required for accurate interruption tracking.
+- **`AdkBasedLLMService(app, session_service, session_params)`**: Main LLM service. Pass a pre-built ADK `App` (must have `ResumabilityConfig(is_resumable=True)`), or pass `agent` + `plugins` and the service builds the `App` internally. Override `_on_state_delta(state_delta)` to forward state to clients, and `process_frame` + `_persist_and_run(content, state_delta)` to inject system events.
+- **`SessionParams(app_name, user_id, session_id)`**: Dataclass for session identification. `app_name` must match the `App.name`.
+- **`AdkInterruptionPlugin`**: ADK plugin for deterministic interruption handling. Include in `App(plugins=[AdkInterruptionPlugin()])`.
 
 ### Context Aggregators
 
