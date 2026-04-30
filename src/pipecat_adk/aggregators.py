@@ -2,7 +2,7 @@
 
 ADK owns conversation history. These aggregators:
 - Persist user speech to the ADK session and push AdkContextFrame
-- Track what TTS text was spoken per audio context
+- Track what TTS text was spoken during the current bot turn
 - Write [HEARD] events to the ADK session on interruption
 - Prevent ADK function call frames from polluting Pipecat's LLMContext
 """
@@ -15,6 +15,7 @@ from google.adk.sessions.base_session_service import BaseSessionService
 from google.genai.types import Content, Part
 from loguru import logger
 from pipecat.frames.frames import (
+    BotStoppedSpeakingFrame,
     Frame,
     FunctionCallCancelFrame,
     FunctionCallInProgressFrame,
@@ -31,7 +32,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 
-from .frames import AdkAudioContextCompletedFrame, AdkContextFrame
+from .frames import AdkContextFrame
 from .types import SessionParams
 
 
@@ -114,12 +115,14 @@ class AdkUserContextAggregator(LLMUserAggregator):
 
 
 class AdkAssistantContextAggregator(LLMAssistantAggregator):
-    """Tracks spoken assistant text per TTS audio context.
+    """Tracks spoken assistant text for the current bot turn.
 
-    On interruption, writes a [HEARD] event to the ADK session for each
-    audio context that was still in progress (i.e., not yet completed).
-    AdkInterruptionPlugin reads these markers in before_model_callback and
-    truncates the corresponding model event deterministically.
+    Accumulates text from TTSTextFrame into a flat buffer. At turn end:
+    - Interrupted (InterruptionFrame): writes a [HEARD] event to the ADK session,
+      then clears the buffer. AdkInterruptionPlugin reads [HEARD] markers in
+      before_model_callback and truncates the preceding model event deterministically.
+    - Clean (BotStoppedSpeakingFrame without prior interruption): clears the buffer
+      with no [HEARD] event — the full response is already in the ADK session.
 
     Also no-ops function call frame handlers so ADK function calls don't
     pollute Pipecat's LLMContext.
@@ -142,8 +145,8 @@ class AdkAssistantContextAggregator(LLMAssistantAggregator):
         super().__init__(context=LLMContext(), params=params)
         self.session_service = session_service
         self.session_params = session_params
-        # context_id (TTS-assigned UUID) → list of text chunks spoken in that context
-        self._context_aggregation: dict[str, list[str]] = {}
+        # Text chunks spoken this bot turn, in order of TTS emission.
+        self._spoken_text: list[str] = []
 
     async def push_aggregation(self) -> str:
         """No-op: ADK already has the full assistant response in its session.
@@ -158,25 +161,23 @@ class AdkAssistantContextAggregator(LLMAssistantAggregator):
         return aggregation
 
     async def _handle_text(self, frame) -> None:
-        """Accumulate spoken text per TTS context_id alongside parent tracking."""
+        """Accumulate spoken text alongside parent tracking."""
         await super()._handle_text(frame)
-        if isinstance(frame, TTSTextFrame) and frame.context_id and frame.text:
-            self._context_aggregation.setdefault(frame.context_id, []).append(frame.text)
+        if isinstance(frame, TTSTextFrame) and frame.text:
+            self._spoken_text.append(frame.text)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        if isinstance(frame, AdkAudioContextCompletedFrame):
-            # Audio for this context played fully — no interruption, no [HEARD] needed.
-            self._context_aggregation.pop(frame.context_id, None)
-        else:
-            await super().process_frame(frame, direction)
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            # Turn ended cleanly — full response already in ADK session, no [HEARD] needed.
+            self._spoken_text.clear()
+        await super().process_frame(frame, direction)
 
     async def _handle_interruptions(self, frame: InterruptionFrame) -> None:
-        """Write [HEARD] events for all in-progress audio contexts, then reset."""
-        for context_id, text_parts in list(self._context_aggregation.items()):
-            heard_text = " ".join(text_parts).strip()
-            if heard_text:
-                await self._write_heard_event(heard_text)
-        self._context_aggregation.clear()
+        """Write a [HEARD] event for whatever was spoken before the interruption."""
+        heard_text = " ".join(self._spoken_text).strip()
+        if heard_text:
+            await self._write_heard_event(heard_text)
+        self._spoken_text.clear()
         await super()._handle_interruptions(frame)
 
     async def _write_heard_event(self, heard_text: str) -> None:

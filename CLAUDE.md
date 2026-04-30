@@ -22,10 +22,9 @@ uv run python -m unittest tests.test_with_mocks.TestWithMocks.test_basic_interac
 | File | Key abstraction |
 |------|----------------|
 | `service.py` | `AdkBasedLLMService` — receives `AdkContextFrame`, calls `runner.run_async(invocation_id)`, converts ADK events to Pipecat frames |
-| `aggregators.py` | `AdkUserContextAggregator` — persists user event to ADK, pushes `AdkContextFrame`; `AdkAssistantContextAggregator` — tracks TTS text per `context_id`, writes `[HEARD]` on interruption |
+| `aggregators.py` | `AdkUserContextAggregator` — persists user event to ADK, pushes `AdkContextFrame`; `AdkAssistantContextAggregator` — accumulates spoken text this turn, writes `[HEARD]` on interruption, clears on `BotStoppedSpeakingFrame` |
 | `interruption.py` | `AdkInterruptionPlugin` — `before_model_callback` finds `[HEARD]` markers, truncates preceding model event, removes marker |
-| `tts_invocation.py` | `make_adk_aware_tts(base_class)` — class factory; wraps any `TTSService` to push `AdkAudioContextCompletedFrame` on `on_audio_context_completed` |
-| `frames.py` | `AdkContextFrame(invocation_id)`, `AdkAudioContextCompletedFrame(context_id)` |
+| `frames.py` | `AdkContextFrame(invocation_id)` |
 | `types.py` | `SessionParams(app_name, user_id, session_id)` |
 
 Extension points: `_build_user_event`, `_on_state_delta`, `_persist_and_run` — see [docs/architecture.md](docs/architecture.md).
@@ -42,7 +41,7 @@ ADK commits the full response immediately — audit trail preserved, tool calls 
 
 ### [HEARD] is exact, not fuzzy
 
-Heard text is sourced directly from `TTSTextFrame.text` frames that passed through the pipeline — no difflib, no ASR re-comparison. `make_adk_aware_tts` signals clean completion via `AdkAudioContextCompletedFrame`; only interrupted contexts generate `[HEARD]` events.
+Heard text is sourced directly from `TTSTextFrame.text` frames that passed through the pipeline — no difflib, no ASR re-comparison. At turn end, `AdkAssistantContextAggregator` knows whether the turn was interrupted (`InterruptionFrame`) or clean (`BotStoppedSpeakingFrame`), and acts accordingly: write `[HEARD]` or just clear the buffer.
 
 ### Function call frames: both directions
 
@@ -68,6 +67,7 @@ async with TestRunner(app=app) as runner:   # app = App(name="agents", ...)
 | File | Coverage |
 |------|----------|
 | `test_with_mocks.py` | Integration flows: basic, interruption, function calls, multi-turn |
+| `test_components.py` | Unit tests for `AdkAssistantContextAggregator` [HEARD] logic |
 | `test_plugin.py` | `AdkInterruptionPlugin` edge cases (12 tests) |
 | `test_utils.py` | `simplify_events()` |
 
@@ -77,7 +77,6 @@ async with TestRunner(app=app) as runner:   # app = App(name="agents", ...)
 
 - ADK agent names require underscores: `name="my_agent"` not `name="my-agent"`
 - `AdkBasedLLMService` creates the `App` and `Runner` internally — pass `agent` + `plugins`, not an `App`
-- `make_adk_aware_tts` must wrap the TTS class; without it, completed audio contexts are never cleared from the `[HEARD]` buffer
 
 ## Dependencies
 

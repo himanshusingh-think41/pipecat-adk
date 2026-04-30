@@ -373,12 +373,11 @@ class TestCriticalPaths(unittest.IsolatedAsyncioTestCase):
                 )
 
     async def test_no_heard_event_on_clean_turn(self):
-        """AdkAudioContextCompletedFrame must clear the context so no [HEARD] is written.
+        """No [HEARD] event is written when the bot finishes speaking without interruption.
 
-        On a clean (uninterrupted) turn, make_adk_aware_tts fires
-        on_audio_context_completed, which pushes AdkAudioContextCompletedFrame.
-        AdkAssistantContextAggregator pops that context_id, so no [HEARD] event
-        is written even if TTSTextFrame had populated _context_aggregation.
+        On a clean turn, BotStoppedSpeakingFrame clears AdkAssistantContextAggregator's
+        _spoken_text buffer, so no [HEARD] event is written even though TTSTextFrame
+        had populated the buffer during playback.
         """
         app = self._make_app(MockLLM.single("I will answer your question completely."))
 

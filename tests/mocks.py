@@ -68,7 +68,7 @@ from pipecat.utils.time import time_now_iso8601
 
 from google.adk.apps import App
 from google.adk.sessions import InMemorySessionService
-from pipecat_adk import AdkBasedLLMService, SessionParams, make_adk_aware_tts
+from pipecat_adk import AdkBasedLLMService, SessionParams
 
 
 # ============================================================================
@@ -850,7 +850,7 @@ class TestRunner:
             MockSTTService(),
             context_aggregators.user(),
             self.adk_service,
-            make_adk_aware_tts(MockTTSService)(tts_delay=tts_delay),
+            MockTTSService(tts_delay=tts_delay),
             self.mock_output,
             context_aggregators.assistant(),
         ])
