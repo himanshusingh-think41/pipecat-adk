@@ -28,10 +28,10 @@ def _model(text: str) -> Content:
     return Content(role="model", parts=[Part(text=text)])
 
 
-def _heard(text: str) -> Content:
+def _heard(text: str, invocation_id: str = "inv1") -> Content:
     return Content(
         role="user",
-        parts=[Part(text=f'<system>[HEARD] Agent was interrupted. Candidate only heard: "{text}"</system>')],
+        parts=[Part(text=f'<system>[HEARD] invocation_id="{invocation_id}" Candidate only heard: "{text}"</system>')],
     )
 
 

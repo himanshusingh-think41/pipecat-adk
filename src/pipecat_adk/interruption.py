@@ -1,15 +1,19 @@
 """ADK plugin for deterministic interruption handling.
 
-Replaces the old fuzzy-match InterruptionHandlerPlugin with an exact
-positional approach: find [HEARD] marker events, locate the immediately
-preceding model event, replace its text with the heard text.
+Finds [HEARD] marker events written by AdkAssistantContextAggregator, locates
+the immediately preceding model event, and replaces its text with the heard
+portion — giving the LLM an accurate view of what was actually spoken.
 
-No fuzzy matching. No difflib. The heard text is sourced directly from
-the TTSTextFrame frames that actually reached the assistant aggregator,
-so the correction is always deterministic.
+The [HEARD] format is:
+    <system>[HEARD] invocation_id="{invocation_id}" Candidate only heard: "{heard_text}"</system>
+
+The invocation_id field records which ADK invocation produced the interrupted
+response. Lookup is positional (most recent model event before the marker):
+ADK's LlmRequest.contents strips Event metadata, so Content objects have no
+invocation_id for anchored lookup. Positional lookup is reliable because
+[HEARD] events are always written immediately after their model event.
 """
 
-import re
 from typing import Optional
 
 from google.adk.agents.callback_context import CallbackContext
@@ -19,10 +23,7 @@ from google.adk.plugins.base_plugin import BasePlugin
 from google.genai.types import Content, Part
 from loguru import logger
 
-_HEARD_PATTERN = re.compile(
-    r'\[HEARD\]\s*Agent was interrupted\.\s*Candidate only heard:\s*"(.*?)"',
-    re.DOTALL,
-)
+from .heard import HEARD_PATTERN as _HEARD_PATTERN
 
 
 class AdkInterruptionPlugin(BasePlugin):
@@ -37,7 +38,7 @@ class AdkInterruptionPlugin(BasePlugin):
     Example session history before this plugin runs::
 
         model:  "Have you worked with Java? What frameworks have you used?"
-        user:   '<system>[HEARD] Agent was interrupted. Candidate only heard: "Have you worked with Java?"</system>'
+        user:   '<system>[HEARD] invocation_id="inv1" Candidate only heard: "Have you worked with Java?"</system>'
         user:   "<candidate>Yes, I have used Java...</candidate>"
 
     After this plugin runs, the model event becomes::
@@ -71,12 +72,12 @@ class AdkInterruptionPlugin(BasePlugin):
         new_contents: list[Content] = []
 
         for content in contents:
-            heard_text = self._extract_heard_text(content)
-            if heard_text is not None:
+            result = self._extract_heard(content)
+            if result is not None:
+                _invocation_id, heard_text = result
                 # Find the most recent model event in new_contents
                 model_idx = self._find_previous_model_event(new_contents)
                 if model_idx is not None:
-                    # Replace model event text with only what was heard
                     new_contents[model_idx] = Content(
                         role=new_contents[model_idx].role,
                         parts=[Part(text=heard_text)],
@@ -89,7 +90,7 @@ class AdkInterruptionPlugin(BasePlugin):
                         "AdkInterruptionPlugin: [HEARD] marker found but no preceding "
                         "model event in request — leaving history unchanged."
                     )
-                # Either way, drop the [HEARD] event from the request
+                # Either way, drop the [HEARD] event from the request.
                 modified = True
             else:
                 new_contents.append(content)
@@ -97,13 +98,15 @@ class AdkInterruptionPlugin(BasePlugin):
         contents[:] = new_contents
         return modified
 
-    def _extract_heard_text(self, content: Content) -> Optional[str]:
-        """Return the heard text from a [HEARD] event, or None if not a marker."""
+    def _extract_heard(self, content: Content) -> Optional[tuple[str, str]]:
+        """Return (invocation_id, heard_text) from a [HEARD] event, or None."""
         if not content or not content.parts:
             return None
         full_text = "".join(p.text for p in content.parts if p.text)
         match = _HEARD_PATTERN.search(full_text)
-        return match.group(1) if match else None
+        if match:
+            return match.group(1), match.group(2)
+        return None
 
     def _find_previous_model_event(self, contents: list[Content]) -> Optional[int]:
         """Return the index of the last model/assistant event, or None."""

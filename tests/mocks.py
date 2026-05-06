@@ -68,7 +68,7 @@ from pipecat.utils.time import time_now_iso8601
 
 from google.adk.apps import App
 from google.adk.sessions import InMemorySessionService
-from pipecat_adk import AdkBasedLLMService, SessionParams
+from pipecat_adk import AdkBasedLLMService, AdkTTSMixin, SessionParams
 
 
 # ============================================================================
@@ -649,7 +649,7 @@ class MockOutputTransport(BaseOutputTransport):
 # MockTTSService
 # ============================================================================
 
-class MockTTSService(TTSService):
+class MockTTSService(AdkTTSMixin, TTSService):
     """Mock TTS: encodes text as padded UTF-8 audio chunks.
 
     Follows the HTTP TTS pattern used by real pipecat services (OpenAI,

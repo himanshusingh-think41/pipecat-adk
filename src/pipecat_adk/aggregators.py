@@ -2,12 +2,12 @@
 
 ADK owns conversation history. These aggregators:
 - Persist user speech to the ADK session and push AdkContextFrame
-- Track what TTS text was spoken during the current bot turn
-- Write [HEARD] events to the ADK session on interruption
+- Track per-invocation TTS text using a context_id → accumulation map
+- Write [HEARD] events to the ADK session when an invocation ends interrupted
 - Prevent ADK function call frames from polluting Pipecat's LLMContext
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from google.adk.events.event import Event
@@ -16,12 +16,16 @@ from google.genai.types import Content, Part
 from loguru import logger
 from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
+    CancelFrame,
+    EndFrame,
     Frame,
     FunctionCallCancelFrame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     InterruptionFrame,
+    TTSStoppedFrame,
     TTSTextFrame,
+    TextFrame,
 )
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -32,8 +36,19 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 
-from .frames import AdkContextFrame
+from .frames import AdkContextFrame, AdkLLMFullResponseStartFrame
+from .heard import HEARD_FORMAT
 from .types import SessionParams
+
+
+@dataclass
+class _InvocationAccumulation:
+    """Per-invocation state: TTS text accumulated from actually-played audio."""
+
+    texts: list[str] = field(default_factory=list)
+
+    def heard_text(self) -> str:
+        return " ".join(self.texts).strip()
 
 
 class AdkUserContextAggregator(LLMUserAggregator):
@@ -115,14 +130,18 @@ class AdkUserContextAggregator(LLMUserAggregator):
 
 
 class AdkAssistantContextAggregator(LLMAssistantAggregator):
-    """Tracks spoken assistant text for the current bot turn.
+    """Tracks per-invocation TTS text; writes [HEARD] events on interrupted turns.
 
-    Accumulates text from TTSTextFrame into a flat buffer. At turn end:
-    - Interrupted (InterruptionFrame): writes a [HEARD] event to the ADK session,
-      then clears the buffer. AdkInterruptionPlugin reads [HEARD] markers in
-      before_model_callback and truncates the preceding model event deterministically.
-    - Clean (BotStoppedSpeakingFrame without prior interruption): clears the buffer
-      with no [HEARD] event — the full response is already in the ADK session.
+    Maintains a dict keyed by invocation_id (== TTS context_id) tracking the
+    TTSTextFrame text chunks that actually played (forwarded upstream by transport).
+
+    Lifecycle:
+    - AdkLLMFullResponseStartFrame: creates an entry for the invocation
+    - TTSTextFrame(context_id=X): appends text to entry X (upstream, after audio plays)
+    - InterruptionFrame: writes [HEARD] for any entry with accumulated text; clears map
+    - BotStoppedSpeakingFrame: clears map (clean turn, no [HEARD] needed)
+    - TTSStoppedFrame(context_id=X): pops entry X without [HEARD] (unit-test clean turns;
+      in production, BotStoppedSpeakingFrame handles cleanup instead)
 
     Also no-ops function call frame handlers so ADK function calls don't
     pollute Pipecat's LLMContext.
@@ -142,11 +161,13 @@ class AdkAssistantContextAggregator(LLMAssistantAggregator):
             session_params: Session identification (app_name, user_id, session_id).
             params: Optional aggregator params.
         """
+        # LLMContext() is required by the parent class but intentionally unused:
+        # ADK owns conversation state, so push_aggregation() is a no-op.
         super().__init__(context=LLMContext(), params=params)
         self.session_service = session_service
         self.session_params = session_params
-        # Text chunks spoken this bot turn, in order of TTS emission.
-        self._spoken_text: list[str] = []
+        # Keyed by invocation_id (== TTS context_id).
+        self._invocations: dict[str, _InvocationAccumulation] = {}
 
     async def push_aggregation(self) -> str:
         """No-op: ADK already has the full assistant response in its session.
@@ -156,31 +177,53 @@ class AdkAssistantContextAggregator(LLMAssistantAggregator):
         """
         if not self._aggregation:
             return ""
-        aggregation = self.aggregation_string()
         await self.reset()
-        return aggregation
+        return ""
 
-    async def _handle_text(self, frame) -> None:
-        """Accumulate spoken text alongside parent tracking."""
+    async def _handle_text(self, frame: TextFrame) -> None:
+        """Route TTSTextFrame to the per-invocation map; skip super() for all TTS text."""
+        if isinstance(frame, TTSTextFrame):
+            state = self._invocations.get(frame.context_id)
+            if state is not None and frame.text:
+                state.texts.append(frame.text)
+            elif state is None:
+                logger.debug(
+                    f"AdkAssistantContextAggregator: dropped TTSTextFrame with "
+                    f"unknown context_id={frame.context_id!r} (stale or non-ADK TTS)"
+                )
+            return  # Do NOT call super(); do NOT populate _aggregation.
         await super()._handle_text(frame)
-        if isinstance(frame, TTSTextFrame) and frame.text:
-            self._spoken_text.append(frame.text)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        if isinstance(frame, BotStoppedSpeakingFrame):
-            # Turn ended cleanly — full response already in ADK session, no [HEARD] needed.
-            self._spoken_text.clear()
+        if isinstance(frame, AdkLLMFullResponseStartFrame):
+            if frame.invocation_id in self._invocations:
+                logger.warning(
+                    f"AdkAssistantContextAggregator: overwriting existing entry for "
+                    f"invocation_id={frame.invocation_id}"
+                )
+            self._invocations[frame.invocation_id] = _InvocationAccumulation()
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            # Clean turn end — full response in ADK session, no [HEARD] needed.
+            self._invocations.clear()
+        elif isinstance(frame, TTSStoppedFrame) and frame.context_id:
+            # Unit-test clean-turn signal: pop entry without writing [HEARD].
+            # In production, BotStoppedSpeakingFrame handles clean-turn cleanup;
+            # TTSStoppedFrame is not sent by the TTS service on interruption.
+            self._invocations.pop(frame.context_id, None)
+        elif isinstance(frame, (EndFrame, CancelFrame)):
+            self._invocations.clear()
+
         await super().process_frame(frame, direction)
 
     async def _handle_interruptions(self, frame: InterruptionFrame) -> None:
-        """Write a [HEARD] event for whatever was spoken before the interruption."""
-        heard_text = " ".join(self._spoken_text).strip()
-        if heard_text:
-            await self._write_heard_event(heard_text)
-        self._spoken_text.clear()
+        """Write [HEARD] for all active invocations with accumulated text, then clear."""
+        for inv_id, state in list(self._invocations.items()):
+            if state.heard_text():
+                await self._write_heard_event(state.heard_text(), inv_id)
+        self._invocations.clear()
         await super()._handle_interruptions(frame)
 
-    async def _write_heard_event(self, heard_text: str) -> None:
+    async def _write_heard_event(self, heard_text: str, invocation_id: str) -> None:
         session = await self.session_service.get_session(
             app_name=self.session_params.app_name,
             user_id=self.session_params.user_id,
@@ -197,11 +240,17 @@ class AdkAssistantContextAggregator(LLMAssistantAggregator):
             author="user",
             content=Content(
                 role="user",
-                parts=[Part(text=f'<system>[HEARD] Agent was interrupted. Candidate only heard: "{heard_text}"</system>')],
+                parts=[Part(text=HEARD_FORMAT.format(
+                    invocation_id=invocation_id,
+                    heard_text=heard_text,
+                ))],
             ),
         )
         await self.session_service.append_event(session, event)
-        logger.info(f"Wrote [HEARD] event for session {self.session_params.session_id}")
+        logger.info(
+            f"Wrote [HEARD] event for invocation_id={invocation_id} "
+            f"session={self.session_params.session_id}"
+        )
 
     # ADK manages function call lifecycle internally. These no-ops prevent
     # function call frames from being added to LLMContext (which would cause

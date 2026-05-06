@@ -25,7 +25,6 @@ from pipecat.frames.frames import (
     FunctionCallsStartedFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
-    LLMTextFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -38,7 +37,7 @@ from .aggregators import (
     AdkContextAggregatorPair,
     AdkUserContextAggregator,
 )
-from .frames import AdkContextFrame
+from .frames import AdkContextFrame, AdkLLMFullResponseStartFrame, AdkLLMTextFrame
 from .types import SessionParams
 
 
@@ -194,7 +193,7 @@ class AdkBasedLLMService(LLMService):
         Args:
             invocation_id: The invocation_id of the pre-persisted user event.
         """
-        await self.push_frame(LLMFullResponseStartFrame())
+        await self.push_frame(AdkLLMFullResponseStartFrame(invocation_id=invocation_id))
         await self.start_ttfb_metrics()
 
         prompt_tokens = 0
@@ -259,7 +258,9 @@ class AdkBasedLLMService(LLMService):
             if text_parts:
                 text = "".join(text_parts)
                 if text:
-                    await self.push_frame(LLMTextFrame(text=text))
+                    await self.push_frame(
+                        AdkLLMTextFrame(text=text, invocation_id=event.invocation_id)
+                    )
 
         for part in event.content.parts:
             if part.function_call:
