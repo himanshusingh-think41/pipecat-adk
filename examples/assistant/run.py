@@ -6,22 +6,28 @@ This server handles WebRTC signaling and manages bot instances.
 import argparse
 import asyncio
 import logging
+import uuid
 from contextlib import asynccontextmanager
-from typing import Dict
+from typing import Any, Dict, List, Optional, Union
 
 import uvicorn
 from bot import run_bot
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, Request, Response
 from fastapi.responses import RedirectResponse
 from pipecat_ai_small_webrtc_prebuilt.frontend import SmallWebRTCPrebuiltUI
 
-from pipecat.transports.network.webrtc_connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.request_handler import (
+    IceCandidate,
+    SmallWebRTCPatchRequest,
+    SmallWebRTCRequest,
+    SmallWebRTCRequestHandler,
+)
 
 # Load environment variables
 load_dotenv(override=True)
 
-# Configure logger
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
@@ -31,10 +37,13 @@ logger = logging.getLogger("pipecat-server")
 
 app = FastAPI()
 
-# Store connections by pc_id
-pcs_map: Dict[str, SmallWebRTCConnection] = {}
+# In-memory store of active sessions: session_id -> session info
+active_sessions: Dict[str, Dict[str, Any]] = {}
 
-ice_servers = ["stun:stun.l.google.com:19302"]
+# SmallWebRTC request handler
+small_webrtc_handler = SmallWebRTCRequestHandler(
+    ice_servers=None,  # Uses default STUN servers
+)
 
 # Mount the frontend at /client
 app.mount("/client", SmallWebRTCPrebuiltUI)
@@ -42,62 +51,96 @@ app.mount("/client", SmallWebRTCPrebuiltUI)
 
 @app.get("/", include_in_schema=False)
 async def root_redirect():
-    """Redirect root to the client UI."""
     return RedirectResponse(url="/client/")
 
 
+@app.post("/start")
+async def rtvi_start(request: Request):
+    """Session init endpoint expected by pipecat-ai-small-webrtc-prebuilt v2+."""
+    try:
+        request_data = await request.json()
+    except Exception:
+        request_data = {}
+
+    session_id = str(uuid.uuid4())
+    active_sessions[session_id] = request_data
+
+    result: dict = {"sessionId": session_id}
+    if request_data.get("enableDefaultIceServers"):
+        result["iceConfig"] = {
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        }
+    return result
+
+
 @app.post("/api/offer")
-async def offer(request: dict, background_tasks: BackgroundTasks):
-    """Handle WebRTC offer/answer negotiation."""
-    pc_id = request.get("pc_id")
+async def offer(request: SmallWebRTCRequest, background_tasks: BackgroundTasks):
+    """Handle WebRTC SDP offer."""
+    async def on_connection(connection: SmallWebRTCConnection):
+        background_tasks.add_task(run_bot, connection)
 
-    if pc_id and pc_id in pcs_map:
-        pipecat_connection = pcs_map[pc_id]
-        logger.info(f"Reusing existing connection for pc_id: {pc_id}")
-        await pipecat_connection.renegotiate(
-            sdp=request["sdp"], type=request["type"], restart_pc=request.get("restart_pc", False)
-        )
-    else:
-        pipecat_connection = SmallWebRTCConnection(ice_servers)
-        await pipecat_connection.initialize(sdp=request["sdp"], type=request["type"])
+    return await small_webrtc_handler.handle_web_request(
+        request=request,
+        webrtc_connection_callback=on_connection,
+    )
 
-        @pipecat_connection.event_handler("closed")
-        async def handle_disconnected(webrtc_connection: SmallWebRTCConnection):
-            logger.info(f"Discarding peer connection for pc_id: {webrtc_connection.pc_id}")
-            pcs_map.pop(webrtc_connection.pc_id, None)
 
-        background_tasks.add_task(run_bot, pipecat_connection)
+@app.patch("/api/offer")
+async def ice_candidate(request: SmallWebRTCPatchRequest):
+    """Handle trickle ICE candidates."""
+    await small_webrtc_handler.handle_patch_request(request)
+    return {"status": "success"}
 
-    answer = pipecat_connection.get_answer()
-    # Update the peer connection in the map
-    pcs_map[answer["pc_id"]] = pipecat_connection
 
-    return answer
+@app.api_route(
+    "/sessions/{session_id}/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+)
+async def proxy_session(
+    session_id: str, path: str, request: Request, background_tasks: BackgroundTasks
+):
+    """Proxy route: forwards /sessions/{id}/api/offer to the offer handler."""
+    if session_id not in active_sessions:
+        return Response(content="Invalid session", status_code=404)
+
+    if path.endswith("api/offer"):
+        try:
+            body = await request.json()
+            if request.method == "POST":
+                webrtc_request = SmallWebRTCRequest(
+                    sdp=body["sdp"],
+                    type=body["type"],
+                    pc_id=body.get("pc_id"),
+                    restart_pc=body.get("restart_pc"),
+                )
+                return await offer(webrtc_request, background_tasks)
+            elif request.method == "PATCH":
+                patch_request = SmallWebRTCPatchRequest(
+                    pc_id=body["pc_id"],
+                    candidates=[IceCandidate(**c) for c in body.get("candidates", [])],
+                )
+                return await ice_candidate(patch_request)
+        except Exception as e:
+            logger.error(f"Failed to parse WebRTC request: {e}")
+            return Response(content="Invalid WebRTC request", status_code=400)
+
+    return Response(status_code=200)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Handle application lifecycle."""
-    yield  # Run app
-    coros = [pc.close() for pc in pcs_map.values()]
-    await asyncio.gather(*coros)
-    pcs_map.clear()
+    yield
+    await small_webrtc_handler.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pipecat ADK Assistant Bot")
-    parser.add_argument(
-        "--host", default="localhost", help="Host for HTTP server (default: localhost)"
-    )
-    parser.add_argument(
-        "--port", type=int, default=7860, help="Port for HTTP server (default: 7860)"
-    )
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--verbose", "-v", action="count")
     args = parser.parse_args()
 
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
 
     uvicorn.run(app, host=args.host, port=args.port)

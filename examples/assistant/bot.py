@@ -11,7 +11,7 @@ import os
 import sys
 
 from dotenv import load_dotenv
-from google.adk.sessions import InMemorySessionService
+from google.adk.sessions import DatabaseSessionService
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -22,37 +22,45 @@ from pipecat.services.google.stt import GoogleSTTService
 from pipecat.services.google.tts import GoogleTTSService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
-from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
 from pipecat.frames.frames import LLMRunFrame
 
-from pipecat_adk import AdkBasedLLMService, SessionParams
+from pipecat_adk import AdkBasedLLMService, AdkTTSMixin, SessionParams
 from agent import app
+from debug_observer import AdkDebugObserver
 
 load_dotenv(override=True)
 
 logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
+logger.add(sys.stderr, level="INFO")
+
+
+class AdkGoogleTTSService(AdkTTSMixin, GoogleTTSService):
+    """GoogleTTSService with ADK invocation_id pinning for [HEARD] tracking."""
+    pass
 
 
 async def run_bot(webrtc_connection):
     """Run the assistant bot with the given WebRTC connection."""
 
-    # Get API key from environment
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    if not os.getenv("GEMINI_API_KEY"):
         raise ValueError("GEMINI_API_KEY environment variable not set")
 
-    # Create session service (in-memory for this example)
-    session_service = InMemorySessionService()
+    # Create session service backed by a local SQLite file
+    db_path = os.path.join(os.path.dirname(__file__), "sessions.db")
+    session_service = DatabaseSessionService(db_url=f"sqlite+aiosqlite:///{db_path}")
 
     # Create session parameters
     session_params = SessionParams(
-        app_name=app.name,  # Use the app name from agent.py
+        app_name=app.name,
         user_id="user",
-        session_id="session-123",
+        session_id="session-001",
     )
-    await session_service.create_session(**session_params.model_dump())
+    # Create session only if it doesn't already exist (DB persists across restarts)
+    existing = await session_service.get_session(**session_params.model_dump())
+    if not existing:
+        await session_service.create_session(**session_params.model_dump())
 
     # Create ADK-based LLM service with the app from agent.py.
     # app already has ResumabilityConfig set — required by AdkBasedLLMService.
@@ -75,13 +83,14 @@ async def run_bot(webrtc_connection):
         )
     )
 
-    # Create TTS service (text-to-speech)
-    tts = GoogleTTSService(
+    # Create TTS service — AdkGoogleTTSService pins context_id to invocation_id
+    # so AdkAssistantContextAggregator can track what was spoken for [HEARD] events.
+    tts = AdkGoogleTTSService(
         voice_id="en-IN-Chirp3-HD-Achird",
         params=GoogleTTSService.InputParams(language=Language.EN_IN),
     )
 
-    # Create transport with video and audio enabled
+    # Create transport with audio enabled
     transport_params = TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
@@ -93,8 +102,7 @@ async def run_bot(webrtc_connection):
         webrtc_connection=webrtc_connection, params=transport_params
     )
 
-    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
-
+    rtvi = RTVIProcessor()
 
     # Create pipeline
     pipeline = Pipeline(
@@ -118,7 +126,7 @@ async def run_bot(webrtc_connection):
             enable_metrics=True,
             enable_usage_metrics=True
         ),
-        observers=[RTVIObserver(rtvi)],
+        observers=[RTVIObserver(rtvi), AdkDebugObserver()],
     )
 
     # Handle client connection
@@ -138,8 +146,6 @@ async def run_bot(webrtc_connection):
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Client connected")
-        # Send greeting prompt to start the conversation
-        await task.queue_frames([context_aggregator.user().get_context_frame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

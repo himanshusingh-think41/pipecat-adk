@@ -12,7 +12,7 @@ A self-contained example demonstrating a voice assistant using pipecat-adk with 
 
 ## Prerequisites
 
-- Python 3.10 or higher
+- Python 3.12 or higher
 - Google Gemini API key ([Get one here](https://makersuite.google.com/app/apikey))
 
 ## Setup
@@ -87,13 +87,13 @@ The library uses an "accountant's approach" for interruptions:
 
 ### Session Management
 
-Each WebRTC connection gets its own ADK session identified by the connection's `pc_id`. Sessions are managed in-memory and automatically cleaned up when connections close.
+Sessions are persisted to a local SQLite file (`sessions.db`) via `DatabaseSessionService`. The session ID is fixed in `bot.py` — all connections share one session, so conversation history accumulates across reconnects. Change `session_id` in `bot.py` to start a fresh conversation.
 
 ## Customization
 
 ### Modifying the Agent
 
-Edit the `SYSTEM_INSTRUCTION` in `bot.py` to change the assistant's personality and behavior:
+Edit `SYSTEM_INSTRUCTION` in `agent.py` to change the assistant's personality and behavior:
 
 ```python
 SYSTEM_INSTRUCTION = """You are a helpful AI assistant. Be concise and friendly.
@@ -102,10 +102,13 @@ Your custom instructions here..."""
 
 ### Changing Voice Settings
 
-Modify the TTS service configuration in `bot.py`:
+Modify the TTS configuration in `bot.py`. Note that the TTS class must use `AdkTTSMixin` (already done in the example) for interruption handling to work correctly:
 
 ```python
-tts = GoogleTTSService(
+class AdkGoogleTTSService(AdkTTSMixin, GoogleTTSService):
+    pass
+
+tts = AdkGoogleTTSService(
     voice_id="en-US-Wavenet-C",  # Change voice here
     params=GoogleTTSService.InputParams(language=Language.EN_US),
 )
@@ -153,11 +156,13 @@ python run.py -v
 
 ```
 examples/assistant/
-├── bot.py              # Bot logic with ADK agent and Pipecat pipeline
+├── agent.py            # ADK Agent and App definition (system instruction lives here)
+├── bot.py              # Pipecat pipeline setup (TTS, STT, transport, session)
 ├── run.py              # FastAPI server and WebRTC signaling
+├── debug_observer.py   # Pipeline frame observer for debugging
 ├── requirements.txt    # Python dependencies
 ├── env.example         # Environment variable template
-└── README.md          # This file
+└── README.md           # This file
 ```
 
 ## Next Steps

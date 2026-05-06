@@ -24,6 +24,7 @@ uv run python -m unittest tests.test_with_mocks.TestWithMocks.test_basic_interac
 | `service.py` | `AdkBasedLLMService` — receives `AdkContextFrame`, calls `runner.run_async(invocation_id)`, converts ADK events to Pipecat frames |
 | `aggregators.py` | `AdkUserContextAggregator` — persists user event to ADK, pushes `AdkContextFrame`; `AdkAssistantContextAggregator` — accumulates spoken text this turn, writes `[HEARD]` on interruption, clears on `BotStoppedSpeakingFrame` |
 | `interruption.py` | `AdkInterruptionPlugin` — `before_model_callback` finds `[HEARD]` markers, truncates preceding model event, removes marker |
+| `tts_mixin.py` | `AdkTTSMixin` — overrides `create_context_id()` to return the ADK `invocation_id`; required for `[HEARD]` tracking |
 | `frames.py` | `AdkContextFrame(invocation_id)` |
 | `types.py` | `SessionParams(app_name, user_id, session_id)` |
 
@@ -42,6 +43,19 @@ ADK commits the full response immediately — audit trail preserved, tool calls 
 ### [HEARD] is exact, not fuzzy
 
 Heard text is sourced directly from `TTSTextFrame.text` frames that passed through the pipeline — no difflib, no ASR re-comparison. At turn end, `AdkAssistantContextAggregator` knows whether the turn was interrupted (`InterruptionFrame`) or clean (`BotStoppedSpeakingFrame`), and acts accordingly: write `[HEARD]` or just clear the buffer.
+
+### AdkTTSMixin is required for [HEARD] tracking
+
+`AdkAssistantContextAggregator` correlates `TTSTextFrame.context_id` with ADK `invocation_id` to know which spoken text belongs to which turn. Standard TTS services generate a random UUID for `context_id` each turn, so the aggregator can never match them. `AdkTTSMixin` overrides `create_context_id()` to return `invocation_id` instead. **Always apply `AdkTTSMixin` to your TTS service** — without it, `[HEARD]` events are never written and interruption handling silently degrades.
+
+```python
+class AdkGoogleTTSService(AdkTTSMixin, GoogleTTSService):
+    pass
+```
+
+### Stale session double-reload in push_aggregation
+
+`AdkUserContextAggregator.push_aggregation` loads the session twice: once to pass to `_build_user_event` (which may read `session.state`), and again immediately before `session_service.append_event`. The second reload is necessary because `runner.run_async` from a concurrent invocation may advance `_storage_update_marker` between the first load and the append, causing a stale-session rejection. The extra round-trip is cheap; the failure mode without it is silent data loss.
 
 ### Function call frames: both directions
 
@@ -80,8 +94,10 @@ async with TestRunner(app=app) as runner:   # app = App(name="agents", ...)
 ## Gotchas
 
 - ADK agent names require underscores: `name="my_agent"` not `name="my-agent"`
-- `AdkBasedLLMService` creates the `App` and `Runner` internally — pass `agent` + `plugins`, not an `App`
+- `AdkBasedLLMService` accepts either `app=App(...)` (full control) or `agent + plugins` (service builds App internally). Either way, the App **must** have `ResumabilityConfig(is_resumable=True)`.
+- `AdkTTSMixin` must be mixed into every TTS service used with this library, or `[HEARD]` events will never be written.
+- Use `DatabaseSessionService` for production — `InMemorySessionService` loses all history on restart. Both require creating the session before starting the pipeline.
 
 ## Dependencies
 
-See [`pyproject.toml`](pyproject.toml). Key: `pipecat-ai>=0.0.102,<1.0.0`, `google-adk>=1.18.0`.
+See [`pyproject.toml`](pyproject.toml). Key: `pipecat-ai>=1.1.0,<2.0.0`, `google-adk>=1.18.0`.

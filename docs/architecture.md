@@ -19,22 +19,24 @@ User speaks
       persist Event(invocation_id=X, author="user", ...) to session
       push AdkContextFrame(invocation_id=X)
   → AdkBasedLLMService
-      LLMFullResponseStartFrame
+      AdkLLMFullResponseStartFrame(invocation_id=X)
       runner.run_async(invocation_id=X) → stream ADK events
-        partial event → LLMTextFrame
+        partial event → AdkLLMTextFrame(text, invocation_id=X)
         function call → FunctionCallsStartedFrame + FunctionCallInProgressFrame (both directions)
         function response → FunctionCallResultFrame (both directions)
         state_delta → _on_state_delta(state_delta)
       LLMFullResponseEndFrame
-  → TTS (wrapped with make_adk_aware_tts)
-      TTSTextFrame(context_id=C, text="sentence 1")
-      TTSTextFrame(context_id=C, text="sentence 2")
-      on_audio_context_completed(C) → AdkAudioContextCompletedFrame(context_id=C)
+  → TTS (must be wrapped with AdkTTSMixin)
+      AdkLLMFullResponseStartFrame triggers mixin to set _pending_adk_invocation_id=X
+      mixin.create_context_id() returns X instead of a random UUID
+      TTSTextFrame(context_id=X, text="sentence 1")
+      TTSTextFrame(context_id=X, text="sentence 2")
   → transport.output()
   → AdkAssistantContextAggregator
-      accumulate TTSTextFrame.text per context_id
-      on AdkAudioContextCompletedFrame: clear that context (no interruption occurred)
-      on InterruptionFrame: write [HEARD] event(s) for any in-progress contexts
+      AdkLLMFullResponseStartFrame: register invocation X in _invocations dict
+      TTSTextFrame(context_id=X): append text to _invocations[X]
+      BotStoppedSpeakingFrame: clear _invocations (clean turn, no [HEARD] needed)
+      InterruptionFrame: write [HEARD] event for each invocation with accumulated text
 ```
 
 ---
@@ -58,7 +60,7 @@ Instead, the bridge uses an "accountant's approach": commit everything immediate
 
 **Step 2: The aggregator tracks what was spoken**
 
-`AdkAssistantContextAggregator` accumulates `TTSTextFrame` text keyed by `context_id`. Each TTS audio context corresponds to one agent invocation — all sentences in a single response share one `context_id`. When `make_adk_aware_tts` signals that an audio context completed cleanly (`on_audio_context_completed`), the bridge pushes `AdkAudioContextCompletedFrame` and the aggregator discards that context — no correction needed.
+`AdkAssistantContextAggregator` accumulates `TTSTextFrame` text keyed by `context_id`. `AdkTTSMixin` (which must be applied to the TTS service) overrides `create_context_id()` to return the current ADK `invocation_id` instead of a random UUID, so all sentences for a single agent response share the same `context_id = invocation_id`. When a `BotStoppedSpeakingFrame` arrives (clean turn, no interruption), the aggregator clears the tracking map — no correction needed.
 
 **Step 3: On interruption, write a [HEARD] event**
 
@@ -186,7 +188,7 @@ The stable extension surface:
 
 | Symbol | Description |
 |--------|-------------|
-| `AdkBasedLLMService.__init__(agent, session_service, session_params, plugins)` | Construct the service |
+| `AdkBasedLLMService.__init__(app, session_service, session_params)` | Construct with a pre-built `App`; alternatively pass `agent + plugins` to have the service build the `App` internally |
 | `AdkBasedLLMService._persist_and_run(content, state_delta?)` | Inject event and run agent |
 | `AdkBasedLLMService._on_state_delta(state_delta)` | Override to push state to client |
 | `AdkUserContextAggregator._build_user_event(text, session) → Event` | Override to customize user events |

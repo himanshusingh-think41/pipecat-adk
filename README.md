@@ -53,10 +53,10 @@ pipeline = Pipeline([
 ### After (With pipecat-adk)
 
 ```python
-from pipecat_adk import AdkBasedLLMService, AdkInterruptionPlugin, SessionParams
+from pipecat_adk import AdkBasedLLMService, AdkInterruptionPlugin, AdkTTSMixin, SessionParams
 from google.adk.agents import Agent
 from google.adk.apps.app import App, ResumabilityConfig
-from google.adk.sessions import InMemorySessionService
+from google.adk.sessions import DatabaseSessionService
 from pipecat.services.google.tts import GoogleTTSService
 from pipecat.pipeline.pipeline import Pipeline
 
@@ -73,14 +73,16 @@ app = App(
     resumability_config=ResumabilityConfig(is_resumable=True),
 )
 
-# 2. Set up session management
-session_service = InMemorySessionService()
+# 2. Set up session management (DatabaseSessionService persists across restarts)
+session_service = DatabaseSessionService(db_url="sqlite+aiosqlite:///sessions.db")
 session_params = SessionParams(
     app_name=app.name,
     user_id="user_123",
     session_id="session_456",
 )
-await session_service.create_session(**session_params.model_dump())
+existing = await session_service.get_session(**session_params.model_dump())
+if not existing:
+    await session_service.create_session(**session_params.model_dump())
 
 # 3. Create the LLM service
 llm = AdkBasedLLMService(
@@ -92,7 +94,11 @@ llm = AdkBasedLLMService(
 # 4. Create context aggregators — pipeline structure stays the same
 context_aggregator = llm.create_context_aggregator()
 
-tts = GoogleTTSService(voice_id=...)
+# 5. Wrap TTS with AdkTTSMixin — required for [HEARD] interruption tracking
+class AdkGoogleTTSService(AdkTTSMixin, GoogleTTSService):
+    pass
+
+tts = AdkGoogleTTSService(voice_id=...)
 
 pipeline = Pipeline([
     transport.input(),
@@ -127,8 +133,8 @@ The user's transcription is sent directly to ADK without modification.
 **The Problem**: Pipecat's context is ephemeral—restart the server and you lose everything. Building features like conversation replay, analytics, or multi-device continuity requires custom persistence logic.
 
 **Our Solution**: Use any ADK session service. ADK provides:
-- `InMemorySessionService` for development
-- `DatabaseSessionService` for production persistence
+- `InMemorySessionService` for development (history lost on restart)
+- `DatabaseSessionService` for production persistence (requires `aiosqlite` for SQLite or the appropriate async driver for other databases)
 - Custom implementations for your specific needs
 
 Every event is persisted automatically. You get full conversation history across restarts, audit trails for compliance, and session handoff between agents.
@@ -383,17 +389,18 @@ simplified = simplify_events(events)
 - **`AdkBasedLLMService(app, session_service, session_params)`**: Main LLM service. Pass a pre-built ADK `App` (must have `ResumabilityConfig(is_resumable=True)`), or pass `agent` + `plugins` and the service builds the `App` internally. Override `_on_state_delta(state_delta)` to forward state to clients, and `process_frame` + `_persist_and_run(content, state_delta)` to inject system events.
 - **`SessionParams(app_name, user_id, session_id)`**: Dataclass for session identification. `app_name` must match the `App.name`.
 - **`AdkInterruptionPlugin`**: ADK plugin for deterministic interruption handling. Include in `App(plugins=[AdkInterruptionPlugin()])`.
+- **`AdkTTSMixin`**: Mixin that must be applied to every TTS service. Overrides `create_context_id()` to return the ADK `invocation_id`, enabling `[HEARD]` tracking. Without this, interruptions are silently ignored. Usage: `class MyTTS(AdkTTSMixin, GoogleTTSService): pass`
 
 ### Context Aggregators
 
 Created via `llm.create_context_aggregator()`:
 - **User aggregator** (`AdkUserContextAggregator`): Persists speech to ADK, triggers the LLM service. Override `_build_user_event(text, session)` to inject custom context parts.
-- **Assistant aggregator** (`AdkAssistantContextAggregator`): Tracks spoken text per TTS audio context. Writes `[HEARD]` events on interruption.
+- **Assistant aggregator** (`AdkAssistantContextAggregator`): Tracks spoken text per TTS audio context (keyed by `invocation_id` via `AdkTTSMixin`). Writes `[HEARD]` events on interruption.
 
 ## Requirements
 
 - Python >= 3.12
-- pipecat-ai >= 0.0.102, < 1.0.0
+- pipecat-ai >= 1.1.0, < 2.0.0
 - google-adk >= 1.18.0
 - google-genai >= 1.51.0
 

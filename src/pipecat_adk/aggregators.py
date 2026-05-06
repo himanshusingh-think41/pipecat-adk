@@ -103,6 +103,19 @@ class AdkUserContextAggregator(LLMUserAggregator):
             )
 
         event = await self._build_user_event(aggregation, session)
+
+        # Reload session immediately before append to avoid stale marker errors:
+        # runner.run_async may have advanced _storage_update_marker between our
+        # earlier get_session() call and now.
+        session = await self.session_service.get_session(
+            app_name=self.session_params.app_name,
+            user_id=self.session_params.user_id,
+            session_id=self.session_params.session_id,
+        )
+        if session is None:
+            raise RuntimeError(
+                f"ADK session not found: {self.session_params.session_id}"
+            )
         await self.session_service.append_event(session, event)
         logger.debug(f"Persisted user event invocation_id={event.invocation_id}")
 
