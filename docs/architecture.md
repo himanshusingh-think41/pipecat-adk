@@ -191,6 +191,8 @@ The stable extension surface:
 | `AdkBasedLLMService._on_state_delta(state_delta)` | Override to push state to client |
 | `AdkUserContextAggregator._build_user_event(text, session) → Event` | Override to customize user events |
 | `AdkContextAggregatorPair.user()` / `.assistant()` | Access the two aggregators |
-| `make_adk_aware_tts(base_class) → type` | Wrap TTS for interruption tracking |
+| `AdkTTSMixin` | Mixin for TTS services; overrides `create_context_id()` to return `invocation_id`, linking played audio to the ADK invocation for `[HEARD]` tracking |
+| `AdkLLMFullResponseStartFrame(invocation_id)` | Signals start of a new ADK invocation; consumed by the assistant aggregator and `AdkTTSMixin` |
+| `AdkLLMTextFrame(text, invocation_id)` | LLM text with provenance; `append_to_context=False` so parent aggregator never accumulates it |
 
 Internal and not stable: `_run_adk`, `_push_frames_from_event`, `_write_heard_event`, `_context_aggregation`.
