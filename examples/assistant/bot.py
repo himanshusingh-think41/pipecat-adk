@@ -55,7 +55,7 @@ async def run_bot(webrtc_connection):
     session_params = SessionParams(
         app_name=app.name,
         user_id="user",
-        session_id="session-001",
+        session_id="session-002",
     )
     # Create session only if it doesn't already exist (DB persists across restarts)
     existing = await session_service.get_session(**session_params.model_dump())
