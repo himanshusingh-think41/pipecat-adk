@@ -1,31 +1,27 @@
-"""Context aggregators for the ADK-Pipecat bridge.
+"""Context aggregators for the Vql-Pipecat bridge.
 
-ADK owns conversation history. These aggregators:
-- Persist user speech to the ADK session and push AdkContextFrame
-- Track per-invocation TTS text using a context_id → accumulation map
-- Write [HEARD] events to the ADK session when an invocation ends interrupted
-- Prevent ADK function call frames from polluting Pipecat's LLMContext
+The Vql aggregators own the pipecat side of the conversation boundary:
+- VqlUserContextAggregator: mints a turn_id per user turn, pushes VqlContextFrame.
+- VqlAssistantContextAggregator: accumulates spoken TTS text, pushes VqlTurnCompletedFrame
+  upstream to AdkLLMService (which then decides whether to write a [HEARD] event).
+
+Neither aggregator writes to the ADK session — that responsibility stays entirely
+in AdkLLMService.  The session_service / session_params that the old aggregators
+needed are gone; see docs/turn-id-propagation.md for the full flow.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
+from uuid import uuid4
 
-from google.adk.events.event import Event
-from google.adk.sessions.base_session_service import BaseSessionService
-from google.genai.types import Content, Part
 from loguru import logger
 from pipecat.frames.frames import (
-    BotStoppedSpeakingFrame,
-    CancelFrame,
-    EndFrame,
     Frame,
     FunctionCallCancelFrame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
-    InterruptionFrame,
+    LLMFullResponseEndFrame,
     TTSStoppedFrame,
-    TTSTextFrame,
-    TextFrame,
 )
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -35,240 +31,169 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.processors.frame_processor import FrameDirection
-
-from .frames import AdkContextFrame, AdkLLMFullResponseStartFrame
-from .heard import HEARD_FORMAT
-from .types import SessionParams
-
-
-@dataclass
-class _InvocationAccumulation:
-    """Per-invocation state: TTS text accumulated from actually-played audio."""
-
-    texts: list[str] = field(default_factory=list)
-
-    def heard_text(self) -> str:
-        return " ".join(self.texts).strip()
+from .frames import (
+    VqlContextFrame,
+    VqlInterruptionFrame,
+    VqlTurnCompletedFrame,
+)
 
 
-class AdkUserContextAggregator(LLMUserAggregator):
-    """Persists user speech to ADK session and triggers the LLM service.
+class VqlUserContextAggregator(LLMUserAggregator):
+    """User context aggregator for Vql pipelines.
 
-    Overrides push_aggregation to bypass Pipecat's LLMContext entirely.
-    After persisting the user event, pushes AdkContextFrame(invocation_id)
-    so AdkBasedLLMService knows which pre-persisted event to resume.
+    Generates a fresh turn_id (UUID hex) on each user turn and pushes
+    VqlContextFrame(turn_id, text) so AdkLLMService can route to the ADK runner.
+    No ADK session writes happen here — the text travels to AdkLLMService via the frame.
 
-    Override _build_user_event to inject application-specific context
-    (section info, code diffs, timing messages, etc.) into the user event.
+    State exception (the only self._ variable):
+        _prev_turn_id: the turn_id of the most recent completed turn.  Stored so
+        that broadcast_interruption() can annotate VqlInterruptionFrame with the
+        turn that is being cut off, letting VqlAssistantContextAggregator track
+        the [HEARD] text without needing its own state.
+
+    Extension point: override push_aggregation() to customize VqlContextFrame.
     """
 
-    def __init__(
-        self,
-        session_service: BaseSessionService,
-        session_params: SessionParams,
-        *,
-        params: Optional[LLMUserAggregatorParams] = None,
-    ) -> None:
-        """Initialize the user context aggregator.
-
-        Args:
-            session_service: ADK session service for persisting events.
-            session_params: Session identification (app_name, user_id, session_id).
-            params: Optional aggregator params (turn strategies, idle timeout, etc.).
-        """
+    def __init__(self, *, params: Optional[LLMUserAggregatorParams] = None) -> None:
         super().__init__(context=LLMContext(), params=params)
-        self.session_service = session_service
-        self.session_params = session_params
+        self._prev_turn_id: Optional[str] = None
 
     async def push_aggregation(self) -> str:
-        """Persist user speech to ADK session and push AdkContextFrame.
-
-        Does NOT call super() — ADK owns conversation state, so we skip
-        the standard LLMContext / LLMContextFrame path entirely.
-        """
+        """Push VqlContextFrame(turn_id, text) — skip Pipecat LLMContext entirely."""
         if len(self._aggregation) == 0:
             return ""
 
         aggregation = self.aggregation_string()
         await self.reset()
 
-        session = await self.session_service.get_session(
-            app_name=self.session_params.app_name,
-            user_id=self.session_params.user_id,
-            session_id=self.session_params.session_id,
-        )
-        if session is None:
-            raise RuntimeError(
-                f"ADK session not found: {self.session_params.session_id}"
-            )
-
-        event = await self._build_user_event(aggregation, session)
-
-        # Reload session immediately before append to avoid stale marker errors:
-        # runner.run_async may have advanced _storage_update_marker between our
-        # earlier get_session() call and now.
-        session = await self.session_service.get_session(
-            app_name=self.session_params.app_name,
-            user_id=self.session_params.user_id,
-            session_id=self.session_params.session_id,
-        )
-        if session is None:
-            raise RuntimeError(
-                f"ADK session not found: {self.session_params.session_id}"
-            )
-        await self.session_service.append_event(session, event)
-        logger.debug(f"Persisted user event invocation_id={event.invocation_id}")
-
-        await self.push_frame(AdkContextFrame(invocation_id=event.invocation_id))
+        turn_id = uuid4().hex
+        await self.push_frame(VqlContextFrame(turn_id=turn_id, text=aggregation))
+        self._prev_turn_id = turn_id
         return aggregation
 
-    async def _build_user_event(self, text: str, session) -> Event:
-        """Build the ADK Event for the user's speech.
+    async def broadcast_interruption(self) -> None:
+        # COPIED from FrameProcessor.broadcast_interruption @ pipecat 06233f53e
+        # CHANGED: when _prev_turn_id is set, emit VqlInterruptionFrame(turn_id=prev_turn_id)
+        #          instead of plain InterruptionFrame.  This carries the interrupted turn's
+        #          id downstream so VqlAssistantContextAggregator never needs to store it.
+        #          Falls back to super() when there is no previous turn (first user turn).
+        if self._prev_turn_id is None:
+            await super().broadcast_interruption()
+            return
 
-        Override in a subclass to wrap text in XML tags, append extra context
-        parts (code diffs, timing messages), or add a state_delta.
-
-        Args:
-            text: The aggregated transcription of what the user said.
-            session: The current ADK Session (read state from session.state).
-
-        Returns:
-            An Event ready to be passed to session_service.append_event.
-        """
-        return Event(
-            invocation_id=Event.new_id(),
-            author="user",
-            content=Content(role="user", parts=[Part(text=text)]),
-        )
+        logger.debug(f"{self}: broadcasting Vql interruption for turn_id={self._prev_turn_id}")
+        # Access the name-mangled queue-reset method.  This is the standard Python
+        # pattern when a single-inheritance override needs to replicate a parent
+        # private helper without copying the entire method body.
+        self._FrameProcessor__reset_process_task()  # type: ignore[attr-defined]
+        await self.stop_all_metrics()
+        await self.broadcast_frame(VqlInterruptionFrame, turn_id=self._prev_turn_id)
 
 
-class AdkAssistantContextAggregator(LLMAssistantAggregator):
-    """Tracks per-invocation TTS text; writes [HEARD] events on interrupted turns.
+class VqlAssistantContextAggregator(LLMAssistantAggregator):
+    """Assistant context aggregator for Vql pipelines.
 
-    Maintains a dict keyed by invocation_id (== TTS context_id) tracking the
-    TTSTextFrame text chunks that actually played (forwarded upstream by transport).
+    Accumulates TTS text (what was actually spoken) and, when a turn ends,
+    pushes VqlTurnCompletedFrame(turn_id, text, interrupted) upstream.
+    AdkLLMService receives this and decides whether to write a [HEARD] event.
 
-    Lifecycle:
-    - AdkLLMFullResponseStartFrame: creates an entry for the invocation
-    - TTSTextFrame(context_id=X): appends text to entry X (upstream, after audio plays)
-    - InterruptionFrame: writes [HEARD] for any entry with accumulated text; clears map
-    - BotStoppedSpeakingFrame: clears map (clean turn, no [HEARD] needed)
-    - TTSStoppedFrame(context_id=X): pops entry X without [HEARD] (unit-test clean turns;
-      in production, BotStoppedSpeakingFrame handles cleanup instead)
+    No state for turn_id — it flows through frames:
+    - VqlInterruptionFrame.turn_id (interrupted turns)
+    - TTSStoppedFrame.context_id = turn_id (clean turns, via VqlTTSMixin)
 
-    Also no-ops function call frame handlers so ADK function calls don't
-    pollute Pipecat's LLMContext.
+    No ADK session writes here; no _invocations dict.
     """
 
-    def __init__(
-        self,
-        session_service: BaseSessionService,
-        session_params: SessionParams,
-        *,
-        params: Optional[LLMAssistantAggregatorParams] = None,
-    ) -> None:
-        """Initialize the assistant context aggregator.
-
-        Args:
-            session_service: ADK session service for writing [HEARD] events.
-            session_params: Session identification (app_name, user_id, session_id).
-            params: Optional aggregator params.
-        """
-        # LLMContext() is required by the parent class but intentionally unused:
-        # ADK owns conversation state, so push_aggregation() is a no-op.
+    def __init__(self, *, params: Optional[LLMAssistantAggregatorParams] = None) -> None:
+        # LLMContext() satisfies the parent but is intentionally unused;
+        # ADK owns conversation state, so push_aggregation never writes to context.
         super().__init__(context=LLMContext(), params=params)
-        self.session_service = session_service
-        self.session_params = session_params
-        # Keyed by invocation_id (== TTS context_id).
-        self._invocations: dict[str, _InvocationAccumulation] = {}
+
+    # ------------------------------------------------------------------
+    # Core frame routing
+    # ------------------------------------------------------------------
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        if isinstance(frame, VqlInterruptionFrame):
+            # COPIED behavior from LLMAssistantAggregator._handle_interruptions
+            # @ pipecat 06233f53e
+            # CHANGED: pass turn_id from frame (no self._current_turn_id state);
+            #          _trigger_assistant_turn_stopped pushes VqlTurnCompletedFrame
+            #          upstream instead of writing to LLMContext.
+            await self._trigger_assistant_turn_stopped(
+                turn_id=frame.turn_id, interrupted=True
+            )
+            await self.reset()
+            await self.push_frame(frame, direction)
+
+        elif isinstance(frame, TTSStoppedFrame) and frame.context_id:
+            # context_id == turn_id here because VqlTTSMixin pins _turn_context_id
+            # to VqlLLMFullResponseStartFrame.turn_id (see tts_mixin.py).
+            await self._trigger_assistant_turn_stopped(
+                turn_id=frame.context_id, interrupted=False
+            )
+            await self.push_frame(frame, direction)
+
+        else:
+            await super().process_frame(frame, direction)
+
+    # ------------------------------------------------------------------
+    # Turn completion — carries turn_id as a parameter, never stored
+    # ------------------------------------------------------------------
+
+    async def _trigger_assistant_turn_stopped(  # type: ignore[override]
+        self, *, turn_id: str = "", interrupted: bool = False
+    ) -> None:
+        # COPIED signature pattern from LLMAssistantAggregator._trigger_assistant_turn_stopped
+        # @ pipecat 06233f53e
+        # CHANGED: accepts turn_id parameter (propagated from the triggering frame,
+        #          not from self state); pushes VqlTurnCompletedFrame upstream instead
+        #          of writing aggregation to LLMContext.
+        text = self.aggregation_string()
+        await self.reset()
+        if text and turn_id:
+            await self.push_frame(
+                VqlTurnCompletedFrame(turn_id=turn_id, text=text, interrupted=interrupted),
+                FrameDirection.UPSTREAM,
+            )
+
+    # ------------------------------------------------------------------
+    # Overrides to prevent parent from writing to LLMContext
+    # ------------------------------------------------------------------
 
     async def push_aggregation(self) -> str:
-        """No-op: ADK already has the full assistant response in its session.
+        """Return accumulated text without writing to LLMContext.
 
-        Skips adding to LLMContext and pushing LLMContextFrame. Still resets
-        _aggregation so state stays clean.
+        ADK already holds the full assistant response in its session journal.
+        Writing to Pipecat's LLMContext would duplicate state that ADK owns.
         """
         if not self._aggregation:
             return ""
+        result = self.aggregation_string()
         await self.reset()
-        return ""
+        return result
 
-    async def _handle_text(self, frame: TextFrame) -> None:
-        """Route TTSTextFrame to the per-invocation map; skip super() for all TTS text."""
-        if isinstance(frame, TTSTextFrame):
-            state = self._invocations.get(frame.context_id)
-            if state is not None and frame.text:
-                state.texts.append(frame.text)
-            elif state is None:
-                logger.debug(
-                    f"AdkAssistantContextAggregator: dropped TTSTextFrame with "
-                    f"unknown context_id={frame.context_id!r} (stale or non-ADK TTS)"
-                )
-            return  # Do NOT call super(); do NOT populate _aggregation.
-        await super()._handle_text(frame)
+    async def _handle_llm_end(self, _: LLMFullResponseEndFrame) -> None:
+        # No-op: TTSStoppedFrame.context_id drives turn completion in this pipeline,
+        # not LLMFullResponseEndFrame.  The LLM response may end before all TTS audio
+        # has played; we need to wait until TTS stops to know what was actually spoken.
+        pass
 
-    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        if isinstance(frame, AdkLLMFullResponseStartFrame):
-            if frame.invocation_id in self._invocations:
-                logger.warning(
-                    f"AdkAssistantContextAggregator: overwriting existing entry for "
-                    f"invocation_id={frame.invocation_id}"
-                )
-            self._invocations[frame.invocation_id] = _InvocationAccumulation()
-        elif isinstance(frame, BotStoppedSpeakingFrame):
-            # Clean turn end — full response in ADK session, no [HEARD] needed.
-            self._invocations.clear()
-        elif isinstance(frame, TTSStoppedFrame) and frame.context_id:
-            # Unit-test clean-turn signal: pop entry without writing [HEARD].
-            # In production, BotStoppedSpeakingFrame handles clean-turn cleanup;
-            # TTSStoppedFrame is not sent by the TTS service on interruption.
-            self._invocations.pop(frame.context_id, None)
-        elif isinstance(frame, (EndFrame, CancelFrame)):
-            self._invocations.clear()
+    async def _handle_interruptions(self, frame) -> None:
+        # No-op: VqlInterruptionFrame (intercepted in process_frame above) carries
+        # the turn_id and drives interruption handling.  Plain InterruptionFrame
+        # should not reach here in a correctly wired Vql pipeline.
+        pass
 
-        await super().process_frame(frame, direction)
+    async def _handle_push_aggregation(self) -> None:
+        # No-op: TTSSpeakFrame-driven utterances (greetings etc.) are managed by
+        # the ADK agent and do not need pipecat context updates.
+        pass
 
-    async def _handle_interruptions(self, frame: InterruptionFrame) -> None:
-        """Write [HEARD] for all active invocations with accumulated text, then clear."""
-        for inv_id, state in list(self._invocations.items()):
-            if state.heard_text():
-                await self._write_heard_event(state.heard_text(), inv_id)
-        self._invocations.clear()
-        await super()._handle_interruptions(frame)
-
-    async def _write_heard_event(self, heard_text: str, invocation_id: str) -> None:
-        session = await self.session_service.get_session(
-            app_name=self.session_params.app_name,
-            user_id=self.session_params.user_id,
-            session_id=self.session_params.session_id,
-        )
-        if session is None:
-            logger.warning(
-                f"Cannot write [HEARD] event: session not found ({self.session_params.session_id})"
-            )
-            return
-
-        event = Event(
-            invocation_id=Event.new_id(),
-            author="user",
-            content=Content(
-                role="user",
-                parts=[Part(text=HEARD_FORMAT.format(
-                    invocation_id=invocation_id,
-                    heard_text=heard_text,
-                ))],
-            ),
-        )
-        await self.session_service.append_event(session, event)
-        logger.info(
-            f"Wrote [HEARD] event for invocation_id={invocation_id} "
-            f"session={self.session_params.session_id}"
-        )
-
-    # ADK manages function call lifecycle internally. These no-ops prevent
-    # function call frames from being added to LLMContext (which would cause
-    # "No function call event found" errors). The frames still flow upstream/
-    # downstream via AdkBasedLLMService to inform STTMuteFilter etc.
+    # ------------------------------------------------------------------
+    # Function call no-ops — ADK manages tool calls in its session journal;
+    # letting these frames into LLMContext produces malformed context entries.
+    # ------------------------------------------------------------------
 
     async def _handle_function_call_in_progress(self, frame: FunctionCallInProgressFrame) -> None:
         pass
@@ -281,14 +206,14 @@ class AdkAssistantContextAggregator(LLMAssistantAggregator):
 
 
 @dataclass
-class AdkContextAggregatorPair:
-    """Pair of user and assistant aggregators for ADK pipelines."""
+class VqlContextAggregatorPair:
+    """Pair of Vql user and assistant aggregators for ADK pipelines."""
 
-    _user: AdkUserContextAggregator
-    _assistant: AdkAssistantContextAggregator
+    _user: VqlUserContextAggregator
+    _assistant: VqlAssistantContextAggregator
 
-    def user(self) -> AdkUserContextAggregator:
+    def user(self) -> VqlUserContextAggregator:
         return self._user
 
-    def assistant(self) -> AdkAssistantContextAggregator:
+    def assistant(self) -> VqlAssistantContextAggregator:
         return self._assistant

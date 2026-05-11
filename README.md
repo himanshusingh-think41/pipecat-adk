@@ -53,9 +53,9 @@ pipeline = Pipeline([
 ### After (With pipecat-adk)
 
 ```python
-from pipecat_adk import AdkBasedLLMService, AdkInterruptionPlugin, AdkTTSMixin, SessionParams
+from pipecat_adk import AdkLLMService, AdkInterruptionPlugin, VqlTTSMixin, SessionParams
 from google.adk.agents import Agent
-from google.adk.apps.app import App, ResumabilityConfig
+from google.adk.apps import App
 from google.adk.sessions import DatabaseSessionService
 from pipecat.services.google.tts import GoogleTTSService
 from pipecat.pipeline.pipeline import Pipeline
@@ -70,7 +70,6 @@ app = App(
     name="my_app",
     root_agent=agent,
     plugins=[AdkInterruptionPlugin()],
-    resumability_config=ResumabilityConfig(is_resumable=True),
 )
 
 # 2. Set up session management (DatabaseSessionService persists across restarts)
@@ -85,7 +84,7 @@ if not existing:
     await session_service.create_session(**session_params.model_dump())
 
 # 3. Create the LLM service
-llm = AdkBasedLLMService(
+llm = AdkLLMService(
     app=app,
     session_service=session_service,
     session_params=session_params,
@@ -94,11 +93,11 @@ llm = AdkBasedLLMService(
 # 4. Create context aggregators — pipeline structure stays the same
 context_aggregator = llm.create_context_aggregator()
 
-# 5. Wrap TTS with AdkTTSMixin — required for [HEARD] interruption tracking
-class AdkGoogleTTSService(AdkTTSMixin, GoogleTTSService):
+# 5. Wrap TTS with VqlTTSMixin — required for [HEARD] interruption tracking
+class MyGoogleTTSService(VqlTTSMixin, GoogleTTSService):
     pass
 
-tts = AdkGoogleTTSService(voice_id=...)
+tts = MyGoogleTTSService(voice_id=...)
 
 pipeline = Pipeline([
     transport.input(),
@@ -119,10 +118,10 @@ The pipeline structure stays the same—you swap the LLM service and context agg
 
 **The Problem**: Pipecat manages conversation history by accumulating messages in an `LLMContext`. This works for simple cases, but breaks down when you need sophisticated history management, multi-turn reasoning, or agent handoffs.
 
-**Our Solution**: ADK manages the conversation history. When a user speaks, `AdkUserContextAggregator`:
-1. Persists the user event directly to ADK's session store
-2. Clears Pipecat's context (since ADK owns the history)
-3. Pushes `AdkContextFrame(invocation_id=...)` to trigger the LLM service
+**Our Solution**: ADK manages the conversation history. When a user speaks, `VqlUserContextAggregator`:
+1. Generates a `turn_id` (UUID) for the turn
+2. Pushes `VqlContextFrame(turn_id, text)` downstream to `AdkLLMService`
+3. `AdkLLMService` calls `runner.run_async(new_message=content)` directly — no pre-persist, no session writes from the aggregator
 
 The user's transcription is sent directly to ADK without modification.
 
@@ -147,7 +146,7 @@ Every event is persisted automatically. You get full conversation history across
 
 **Our Solution**: A deterministic, two-part mechanism:
 
-1. When interrupted, `AdkAssistantContextAggregator` knows exactly what TTS text was spoken (it tracks text per audio context via `TTSTextFrame`). It writes a `[HEARD]` event to the ADK session containing only what was actually spoken.
+1. When interrupted, `VqlAssistantContextAggregator` knows exactly what TTS text was spoken (accumulated via `TTSTextFrame`). It pushes `VqlTurnCompletedFrame(interrupted=True, text=...)` upstream to `AdkLLMService`, which writes the `[HEARD]` event to ADK's session.
 2. Before the next LLM call, `AdkInterruptionPlugin` finds the `[HEARD]` marker in the request, locates the preceding model event, and replaces its full text with the heard portion. The marker is then removed from the request.
 
 The LLM sees only what the user actually heard. The full response remains in ADK session history for auditing.
@@ -161,7 +160,7 @@ The LLM sees only what the user actually heard. The full response remains in ADK
 **Our Solution**: Override `_on_state_delta()` in a subclass of `AdkBasedLLMService`. The bridge calls this for every ADK event that carries a `state_delta`, before any text frames from the same event—so the client receives state before the bot starts speaking.
 
 ```python
-class MyLLMService(AdkBasedLLMService):
+class MyLLMService(AdkLLMService):
     async def _on_state_delta(self, state_delta: dict) -> None:
         # Forward state to your client via RTVI, WebSocket, etc.
         await self.push_frame(RTVIServerMessageFrame(
@@ -172,7 +171,7 @@ class MyLLMService(AdkBasedLLMService):
 To inject events programmatically (e.g., a timeout or a form submission), override `process_frame` and call `_persist_and_run`:
 
 ```python
-class MyLLMService(AdkBasedLLMService):
+class MyLLMService(AdkLLMService):
     async def process_frame(self, frame, direction):
         if isinstance(frame, UserIdleFrame):
             await self._persist_and_run(
@@ -184,7 +183,7 @@ class MyLLMService(AdkBasedLLMService):
             await super().process_frame(frame, direction)
 ```
 
-**Tradeoff**: State integration requires subclassing `AdkBasedLLMService`. This keeps the bridge lean but means simple state forwarding can't be done with configuration alone.
+**Tradeoff**: State integration requires subclassing `AdkLLMService`. This keeps the bridge lean but means simple state forwarding can't be done with configuration alone.
 
 ### 5. Function Call Lifecycle
 
@@ -203,27 +202,22 @@ class MyLLMService(AdkBasedLLMService):
 
 **The Problem**: You need to inject dynamic context into conversations—current time, user preferences, system state, etc.
 
-**Our Solution**: Override `_build_user_event()` in a subclass of `AdkUserContextAggregator`:
+**Our Solution**: Override `_build_user_event()` in a subclass of `AdkLLMService`:
 
 ```python
-from pipecat_adk.aggregators import AdkUserContextAggregator
-from google.adk.events import Event, EventActions
+from pipecat_adk import AdkLLMService
 from google.genai.types import Content, Part
+from datetime import datetime
 
-class MyUserAggregator(AdkUserContextAggregator):
-    async def _build_user_event(self, text: str, session) -> Event:
-        parts = [
+class MyLLMService(AdkLLMService):
+    async def _build_user_event(self, text: str) -> Content:
+        return Content(role="user", parts=[
             Part(text=f"<system>Current time: {datetime.now()}</system>"),
             Part(text=text),
-        ]
-        return Event(
-            invocation_id=Event.new_id(),
-            author="user",
-            content=Content(role="user", parts=parts),
-        )
+        ])
 ```
 
-Then pass your aggregator to `create_context_aggregator` — or build the `AdkContextAggregatorPair` manually and use it in the pipeline.
+Pass your custom service class instead of `AdkLLMService` when constructing the pipeline.
 
 **Tradeoff**: This runs on every user message. Keep it lightweight—avoid slow database queries or API calls here, or at least await them with care.
 
@@ -233,7 +227,7 @@ pipecat-adk takes a fundamentally different approach to context management: **AD
 
 ### Why This Matters
 
-Standard Pipecat components expect to read/write messages via `OpenAILLMContext`. Since ADK manages conversation history in its own session store, our context frames only carry an `invocation_id` reference—not the actual messages.
+Standard Pipecat components expect to read/write messages via `OpenAILLMContext`. Since ADK manages conversation history in its own session store, our context frames only carry a `turn_id` reference—not the actual messages.
 
 ### Incompatible Components
 
@@ -386,16 +380,16 @@ simplified = simplify_events(events)
 
 ### Core Classes
 
-- **`AdkBasedLLMService(app, session_service, session_params)`**: Main LLM service. Pass a pre-built ADK `App` (must have `ResumabilityConfig(is_resumable=True)`), or pass `agent` + `plugins` and the service builds the `App` internally. Override `_on_state_delta(state_delta)` to forward state to clients, and `process_frame` + `_persist_and_run(content, state_delta)` to inject system events.
+- **`AdkLLMService(app, session_service, session_params)`**: Main LLM service. Pass a pre-built ADK `App`, or pass `agent` + `plugins` and the service builds the `App` internally. Override `_build_user_event(text)` to inject custom context, `_on_state_delta(state_delta)` to forward state to clients, and `process_frame` + `_persist_and_run(content, state_delta)` to inject system events.
 - **`SessionParams(app_name, user_id, session_id)`**: Dataclass for session identification. `app_name` must match the `App.name`.
 - **`AdkInterruptionPlugin`**: ADK plugin for deterministic interruption handling. Include in `App(plugins=[AdkInterruptionPlugin()])`.
-- **`AdkTTSMixin`**: Mixin that must be applied to every TTS service. Overrides `create_context_id()` to return the ADK `invocation_id`, enabling `[HEARD]` tracking. Without this, interruptions are silently ignored. Usage: `class MyTTS(AdkTTSMixin, GoogleTTSService): pass`
+- **`VqlTTSMixin`**: Mixin that must be applied to every TTS service. Overrides TTS context tracking to use `turn_id` instead of a random UUID, enabling `[HEARD]` tracking. Without this, interruptions are silently ignored. Usage: `class MyTTS(VqlTTSMixin, GoogleTTSService): pass`
 
 ### Context Aggregators
 
 Created via `llm.create_context_aggregator()`:
-- **User aggregator** (`AdkUserContextAggregator`): Persists speech to ADK, triggers the LLM service. Override `_build_user_event(text, session)` to inject custom context parts.
-- **Assistant aggregator** (`AdkAssistantContextAggregator`): Tracks spoken text per TTS audio context (keyed by `invocation_id` via `AdkTTSMixin`). Writes `[HEARD]` events on interruption.
+- **User aggregator** (`VqlUserContextAggregator`): Generates a `turn_id` per user turn and pushes `VqlContextFrame(turn_id, text)` to `AdkLLMService`. Override `_build_user_event` on `AdkLLMService` to inject custom context.
+- **Assistant aggregator** (`VqlAssistantContextAggregator`): Accumulates spoken TTS text per turn. Pushes `VqlTurnCompletedFrame` upstream to `AdkLLMService`, which writes `[HEARD]` events on interruption.
 
 ## Requirements
 

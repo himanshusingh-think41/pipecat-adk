@@ -335,7 +335,7 @@ class TestCriticalPaths(unittest.IsolatedAsyncioTestCase):
             await runner.wait_for(_first_sentence_emitted, timeout=5.0)
 
             # Interrupt during sentence 2. stay_silent lets the event loop deliver
-            # TTSTextFrame1 to AdkAssistantContextAggregator before the interruption fires.
+            # TTSTextFrame1 to VqlAssistantContextAggregator before the interruption fires.
             await runner.stay_silent(iterations=5)
             await runner.speak("Stop please")
 
@@ -375,9 +375,9 @@ class TestCriticalPaths(unittest.IsolatedAsyncioTestCase):
     async def test_no_heard_event_on_clean_turn(self):
         """No [HEARD] event is written when the bot finishes speaking without interruption.
 
-        On a clean turn, BotStoppedSpeakingFrame clears AdkAssistantContextAggregator's
-        _spoken_text buffer, so no [HEARD] event is written even though TTSTextFrame
-        had populated the buffer during playback.
+        On a clean turn, TTSStoppedFrame drives VqlAssistantContextAggregator to push
+        VqlTurnCompletedFrame(interrupted=False) upstream. AdkLLMService sees interrupted=False
+        and does not write a [HEARD] event.
         """
         app = self._make_app(MockLLM.single("I will answer your question completely."))
 

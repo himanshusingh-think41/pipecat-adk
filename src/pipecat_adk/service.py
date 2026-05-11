@@ -2,13 +2,20 @@
 
 Replaces the standard LLM API call with Google ADK's runner.run_async,
 bridging ADK's session-based agent invocations into Pipecat's frame pipeline.
+
+Key design points:
+- AdkLLMService is the only layer that knows the ADK session and invocation_id.
+- turn_id (Vql layer) is mapped to invocation_id (ADK layer) here, in _turn_invocation_map.
+- Session writes (including [HEARD] events) are centralised in this class.
+- runner.run_async receives new_message directly — no pre-persisted events, no ResumabilityConfig.
 """
 
 from typing import Any, Optional, Union
+from uuid import uuid4
 
 from google.adk.agents import BaseAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
-from google.adk.apps.app import App, ResumabilityConfig
+from google.adk.apps.app import App
 from google.adk.events.event import Event
 from google.adk.events.event_actions import EventActions
 from google.adk.runners import Runner
@@ -24,7 +31,6 @@ from pipecat.frames.frames import (
     FunctionCallResultFrame,
     FunctionCallsStartedFrame,
     LLMFullResponseEndFrame,
-    LLMFullResponseStartFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -33,26 +39,34 @@ from pipecat.services.ai_service import AIService
 from pipecat.services.llm_service import LLMService
 
 from .aggregators import (
-    AdkAssistantContextAggregator,
-    AdkContextAggregatorPair,
-    AdkUserContextAggregator,
+    VqlAssistantContextAggregator,
+    VqlContextAggregatorPair,
+    VqlUserContextAggregator,
 )
-from .frames import AdkContextFrame, AdkLLMFullResponseStartFrame, AdkLLMTextFrame
+from .frames import (
+    VqlContextFrame,
+    VqlLLMFullResponseStartFrame,
+    VqlLLMTextFrame,
+    VqlTurnCompletedFrame,
+)
+from .heard import HEARD_FORMAT
 from .types import SessionParams
 
 
-class AdkBasedLLMService(LLMService):
+class AdkLLMService(LLMService):
     """LLM service that drives a Google ADK agent instead of a direct LLM call.
 
-    Receives AdkContextFrame from AdkUserContextAggregator (the user event has
-    already been persisted) and calls runner.run_async(invocation_id=...) to
-    resume the invocation.
+    Receives VqlContextFrame(turn_id, text) from VqlUserContextAggregator, calls
+    runner.run_async(new_message=content) and streams the response as Vql frames.
+
+    The mapping between pipecat's turn_id and ADK's invocation_id lives exclusively
+    here in _turn_invocation_map.  No other layer knows or exposes invocation_id.
 
     Can be constructed two ways:
 
-    1. Pass an ``App`` directly — full control over ADK App config::
+    1. Pass an ``App`` directly::
 
-        llm = AdkBasedLLMService(
+        llm = AdkLLMService(
             app=app,
             session_service=session_service,
             session_params=session_params,
@@ -60,19 +74,17 @@ class AdkBasedLLMService(LLMService):
 
     2. Pass ``agent`` + optional ``plugins`` — the App is built internally::
 
-        llm = AdkBasedLLMService(
+        llm = AdkLLMService(
             agent=agent,
             plugins=[AdkInterruptionPlugin()],
             session_service=session_service,
             session_params=session_params,
         )
 
-    Either way, the App must have ``ResumabilityConfig(is_resumable=True)``; the
-    service validates this and raises ``ValueError`` if it is missing.
-
     Extension points for subclasses:
-    - _on_state_delta(state_delta): called for every ADK event that carries state
-    - _persist_and_run(content, state_delta): inject a system event and run the agent
+    - _build_user_event(text): customise the Content sent to the runner
+    - _on_state_delta(state_delta): forward ADK state deltas to clients
+    - _persist_and_run(content, state_delta): inject a programmatic event and run
     - process_frame: handle domain-specific frames by calling _persist_and_run
     """
 
@@ -92,7 +104,7 @@ class AdkBasedLLMService(LLMService):
         Args:
             session_service: ADK session service (must already have the session created).
             session_params: Session identification (app_name, user_id, session_id).
-            app: A pre-built ADK App. Must have ResumabilityConfig(is_resumable=True).
+            app: A pre-built ADK App.
             agent: The root ADK agent. Mutually exclusive with ``app``.
             plugins: ADK plugins (e.g. AdkInterruptionPlugin). Only used when
                 building the App from ``agent``; ignored when ``app`` is provided.
@@ -111,25 +123,23 @@ class AdkBasedLLMService(LLMService):
             app = App(
                 name=session_params.app_name,
                 root_agent=agent,
-                resumability_config=ResumabilityConfig(is_resumable=True),
                 plugins=plugins or [],
             )
-        else:
-            if not (app.resumability_config and app.resumability_config.is_resumable):
-                raise ValueError(
-                    "The App passed to AdkBasedLLMService must have "
-                    "ResumabilityConfig(is_resumable=True). "
-                    "See docs/invocation-id-and-resumability.md for why this is required."
-                )
 
         self.runner = Runner(app=app, session_service=session_service)
+
+        # Maps pipecat turn_id → ADK invocation_id.
+        # Populated when the first ADK event for a turn arrives; entries are
+        # removed when VqlTurnCompletedFrame is received from the assistant
+        # aggregator.  Only AdkLLMService knows both IDs.
+        self._turn_invocation_map: dict[str, str] = {}
 
     def create_context_aggregator(
         self,
         *,
         user_params: Optional[Any] = None,
         assistant_params: Optional[Any] = None,
-    ) -> AdkContextAggregatorPair:
+    ) -> VqlContextAggregatorPair:
         """Create matching user and assistant aggregators for this service.
 
         Args:
@@ -137,22 +147,15 @@ class AdkBasedLLMService(LLMService):
             assistant_params: Optional LLMAssistantAggregatorParams override.
 
         Returns:
-            AdkContextAggregatorPair with .user() and .assistant() accessors.
+            VqlContextAggregatorPair with .user() and .assistant() accessors.
         """
-        user = AdkUserContextAggregator(
-            session_service=self.session_service,
-            session_params=self.session_params,
-            params=user_params,
-        )
-        assistant = AdkAssistantContextAggregator(
-            session_service=self.session_service,
-            session_params=self.session_params,
-            params=assistant_params,
-        )
-        return AdkContextAggregatorPair(_user=user, _assistant=assistant)
+        user = VqlUserContextAggregator(params=user_params)
+        assistant = VqlAssistantContextAggregator(params=assistant_params)
+        return VqlContextAggregatorPair(_user=user, _assistant=assistant)
 
     async def stop(self, frame: EndFrame) -> None:
         await super().stop(frame)
+        self._turn_invocation_map.clear()
         try:
             await self.runner.close()
         except Exception as e:
@@ -160,40 +163,65 @@ class AdkBasedLLMService(LLMService):
 
     async def cancel(self, frame: CancelFrame) -> None:
         await super().cancel(frame)
+        self._turn_invocation_map.clear()
         try:
             await self.runner.close()
         except Exception as e:
             logger.warning(f"Error closing ADK runner on cancel: {e}")
 
     async def _process_context(self, context: LLMContext) -> None:
-        """No-op: ADK context arrives via AdkContextFrame, not LLMContext."""
+        """No-op: ADK context arrives via VqlContextFrame, not LLMContext."""
         pass
 
     async def push_frame(
         self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM
     ) -> None:
-        # Bypass LLMService's skip_tts injection — we manage TTS skipping explicitly
-        # when needed via frame.skip_tts on individual frames.
+        # Bypass LLMService's skip_tts injection.
         await AIService.push_frame(self, frame, direction)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, AdkContextFrame):
-            await self._run_adk(frame.invocation_id)
-        else:
+        if isinstance(frame, VqlTurnCompletedFrame) and direction == FrameDirection.UPSTREAM:
+            # Consumed here — do not propagate further upstream.
+            invocation_id = self._turn_invocation_map.pop(frame.turn_id, None)
+            if frame.interrupted and frame.text and invocation_id:
+                await self._write_heard_event(invocation_id, frame.text)
+            elif frame.interrupted and not invocation_id:
+                logger.warning(
+                    f"VqlTurnCompletedFrame(interrupted) for turn_id={frame.turn_id!r} "
+                    f"but no invocation_id found in map — [HEARD] not written"
+                )
+
+        elif isinstance(frame, VqlContextFrame):
+            content = await self._build_user_event(frame.text)
+            await self._run_adk(frame.turn_id, content)
+
+        elif not isinstance(frame, VqlTurnCompletedFrame):
+            # Forward everything else (VqlTurnCompletedFrame upstream was handled above).
             await self.push_frame(frame, direction)
 
-    async def _run_adk(self, invocation_id: str) -> None:
-        """Resume a pre-persisted ADK invocation and stream the response.
+    # ------------------------------------------------------------------
+    # ADK runner
+    # ------------------------------------------------------------------
 
-        The caller must have already created and persisted an Event with
-        invocation_id to the session before calling this method.
+    async def _run_adk(
+        self,
+        turn_id: str,
+        content: Content,
+        state_delta: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Call runner.run_async with new_message and stream the response as Vql frames.
+
+        ADK generates invocation_id internally; we learn it from the first event
+        and store it in _turn_invocation_map[turn_id].
 
         Args:
-            invocation_id: The invocation_id of the pre-persisted user event.
+            turn_id: The Vql turn identifier for this invocation.
+            content: The user Content to pass as new_message.
+            state_delta: Optional state changes forwarded to runner.run_async.
         """
-        await self.push_frame(AdkLLMFullResponseStartFrame(invocation_id=invocation_id))
+        await self.push_frame(VqlLLMFullResponseStartFrame(turn_id=turn_id))
         await self.start_ttfb_metrics()
 
         prompt_tokens = 0
@@ -206,13 +234,21 @@ class AdkBasedLLMService(LLMService):
             async for event in self.runner.run_async(
                 user_id=self.session_params.user_id,
                 session_id=self.session_params.session_id,
-                invocation_id=invocation_id,
-                new_message=None,
+                new_message=content,
+                state_delta=state_delta,
                 run_config=RunConfig(streaming_mode=StreamingMode.SSE),
             ):
                 await self.stop_ttfb_metrics()
 
-                # Final event is authoritative for token counts (cumulative in SSE mode)
+                # Learn invocation_id from first event; store turn_id → invocation_id.
+                if event.invocation_id and turn_id not in self._turn_invocation_map:
+                    self._turn_invocation_map[turn_id] = event.invocation_id
+                    logger.debug(
+                        f"ADK invocation_id={event.invocation_id!r} "
+                        f"mapped to turn_id={turn_id!r}"
+                    )
+
+                # Final event is authoritative for token counts (cumulative in SSE mode).
                 if event.usage_metadata and not event.partial:
                     prompt_tokens = event.usage_metadata.prompt_token_count or 0
                     completion_tokens = event.usage_metadata.candidates_token_count or 0
@@ -220,7 +256,7 @@ class AdkBasedLLMService(LLMService):
                     cache_read_input_tokens = event.usage_metadata.cached_content_token_count or 0
                     reasoning_tokens = event.usage_metadata.thoughts_token_count or 0
 
-                await self._push_frames_from_event(event)
+                await self._push_frames_from_event(event, turn_id=turn_id)
 
         except Exception as e:
             logger.exception(f"{self} ADK error: {e}")
@@ -236,7 +272,7 @@ class AdkBasedLLMService(LLMService):
             )
             await self.push_frame(LLMFullResponseEndFrame())
 
-    async def _push_frames_from_event(self, event: Event) -> None:
+    async def _push_frames_from_event(self, event: Event, *, turn_id: str) -> None:
         """Convert one ADK event into Pipecat frames.
 
         State deltas are forwarded to _on_state_delta before any text frames.
@@ -258,15 +294,61 @@ class AdkBasedLLMService(LLMService):
             if text_parts:
                 text = "".join(text_parts)
                 if text:
-                    await self.push_frame(
-                        AdkLLMTextFrame(text=text, invocation_id=event.invocation_id)
-                    )
+                    await self.push_frame(VqlLLMTextFrame(text=text, turn_id=turn_id))
 
         for part in event.content.parts:
             if part.function_call:
                 await self._handle_function_call(part.function_call)
             elif part.function_response:
                 await self._handle_function_response(part.function_response)
+
+    # ------------------------------------------------------------------
+    # Session write: [HEARD] events (only session-write in the library)
+    # ------------------------------------------------------------------
+
+    async def _write_heard_event(self, invocation_id: str, heard_text: str) -> None:
+        """Write a [HEARD] event to the ADK session for the given invocation.
+
+        This is the only place in the library that writes directly to the ADK
+        session.  The event format is consumed by AdkInterruptionPlugin's
+        before_model_callback on the next LLM call.
+        """
+        session = await self.session_service.get_session(
+            app_name=self.session_params.app_name,
+            user_id=self.session_params.user_id,
+            session_id=self.session_params.session_id,
+        )
+        if session is None:
+            logger.warning(
+                f"Cannot write [HEARD]: session not found "
+                f"({self.session_params.session_id})"
+            )
+            return
+
+        event = Event(
+            invocation_id=Event.new_id(),
+            author="user",
+            content=Content(
+                role="user",
+                parts=[
+                    Part(
+                        text=HEARD_FORMAT.format(
+                            invocation_id=invocation_id,
+                            heard_text=heard_text,
+                        )
+                    )
+                ],
+            ),
+        )
+        await self.session_service.append_event(session, event)
+        logger.info(
+            f"Wrote [HEARD] for invocation_id={invocation_id!r} "
+            f"session={self.session_params.session_id!r}"
+        )
+
+    # ------------------------------------------------------------------
+    # Function call / response helpers
+    # ------------------------------------------------------------------
 
     async def _handle_function_call(self, func_call) -> None:
         assert func_call.id, "ADK function call must have an id"
@@ -303,6 +385,26 @@ class AdkBasedLLMService(LLMService):
         await self.push_frame(result, FrameDirection.UPSTREAM)
         await self.push_frame(result, FrameDirection.DOWNSTREAM)
 
+    # ------------------------------------------------------------------
+    # Extension points
+    # ------------------------------------------------------------------
+
+    async def _build_user_event(self, text: str) -> Content:
+        """Build the Content to pass as new_message to runner.run_async.
+
+        Override in a subclass to wrap text in XML tags, append extra context
+        parts (code diffs, timing messages), or otherwise enrich the message.
+        Subclasses may access self.session_service / self.session_params to
+        read session state.
+
+        Args:
+            text: The aggregated transcription of what the user said.
+
+        Returns:
+            A Content object passed directly to runner.run_async(new_message=...).
+        """
+        return Content(role="user", parts=[Part(text=text)])
+
     async def _on_state_delta(self, state_delta: dict) -> None:
         """Called for every ADK event that carries a state_delta.
 
@@ -319,31 +421,16 @@ class AdkBasedLLMService(LLMService):
         content: Content,
         state_delta: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Create an event, persist it to ADK, then run the agent.
+        """Inject a programmatic event and run the agent.
 
         Use this from process_frame overrides to inject system events
         (silence warnings, domain events, etc.) and trigger the agent.
+        A synthetic turn_id is generated; the resulting VqlTurnCompletedFrame
+        will carry it but the content is not tracked for [HEARD] purposes.
 
         Args:
             content: The Content for the event (role="user" with system parts).
-            state_delta: Optional state changes to persist alongside the content.
+            state_delta: Optional state changes forwarded to runner.run_async.
         """
-        session = await self.session_service.get_session(
-            app_name=self.session_params.app_name,
-            user_id=self.session_params.user_id,
-            session_id=self.session_params.session_id,
-        )
-        if session is None:
-            raise RuntimeError(f"ADK session not found: {self.session_params.session_id}")
-
-        event_kwargs: dict[str, Any] = {
-            "invocation_id": Event.new_id(),
-            "author": "user",
-            "content": content,
-        }
-        if state_delta:
-            event_kwargs["actions"] = EventActions(state_delta=state_delta)
-
-        event = Event(**event_kwargs)
-        await self.session_service.append_event(session, event)
-        await self._run_adk(event.invocation_id)
+        turn_id = f"injected_{uuid4().hex}"
+        await self._run_adk(turn_id, content, state_delta)

@@ -25,7 +25,6 @@ from pipecat.frames.frames import (
     LLMFullResponseStartFrame,
     LLMTextFrame,
     StartFrame,
-    StartInterruptionFrame,
     TranscriptionFrame,
     TTSTextFrame,
     UserStartedSpeakingFrame,
@@ -39,7 +38,7 @@ from pipecat.services.tts_service import TTSService
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 
-from pipecat_adk.frames import AdkContextFrame
+from pipecat_adk.frames import VqlContextFrame
 
 
 # Fields whose values should never appear in logs (binary data, internals).
@@ -54,7 +53,6 @@ _FIELD_ALLOWLIST: Dict[Type[Frame], Set[str]] = {
     UserStoppedSpeakingFrame: {"id"},
     BotStartedSpeakingFrame: {"id"},
     BotStoppedSpeakingFrame: {"id"},
-    StartInterruptionFrame: {"id"},
     InterruptionFrame: {"id"},
     LLMFullResponseStartFrame: {"id"},
     LLMFullResponseEndFrame: {"id"},
@@ -63,9 +61,9 @@ _FIELD_ALLOWLIST: Dict[Type[Frame], Set[str]] = {
     FunctionCallsStartedFrame: {"id"},
     FunctionCallInProgressFrame: {"id", "function_name"},
     FunctionCallResultFrame: {"id", "function_name"},
-    # ADK-specific frames — include invocation_id for log correlation.
-    AdkContextFrame: {"id", "invocation_id"},
-    # LLMTextFrame after AdkContextFrame so the dict entry matches first.
+    # Vql frames — include turn_id for log correlation.
+    VqlContextFrame: {"id", "turn_id", "text"},
+    # LLMTextFrame after VqlContextFrame so the dict entry matches first.
     LLMTextFrame: {"id", "text"},
 }
 
@@ -80,7 +78,6 @@ _DEFAULT_FRAME_FILTERS: Dict[Type[Frame], Optional[Tuple[Type, FrameEndpoint]]] 
     BotStartedSpeakingFrame: (BaseOutputTransport, FrameEndpoint.SOURCE),
     BotStoppedSpeakingFrame: (BaseOutputTransport, FrameEndpoint.SOURCE),
     # Interruptions
-    StartInterruptionFrame: (BaseInputTransport, FrameEndpoint.SOURCE),
     InterruptionFrame: (BaseInputTransport, FrameEndpoint.SOURCE),
     # STT
     TranscriptionFrame: (STTService, FrameEndpoint.SOURCE),
@@ -91,8 +88,8 @@ _DEFAULT_FRAME_FILTERS: Dict[Type[Frame], Optional[Tuple[Type, FrameEndpoint]]] 
     FunctionCallsStartedFrame: (LLMService, FrameEndpoint.SOURCE),
     FunctionCallInProgressFrame: (LLMService, FrameEndpoint.SOURCE),
     FunctionCallResultFrame: (LLMService, FrameEndpoint.SOURCE),
-    # ADK frames
-    AdkContextFrame: None,  # log from any source (injected at various points)
+    # Vql frames
+    VqlContextFrame: None,  # log from any source (injected at various points)
     # TTS
     TTSTextFrame: (TTSService, FrameEndpoint.SOURCE),
 }

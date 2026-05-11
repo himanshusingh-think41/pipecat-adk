@@ -1,6 +1,7 @@
 """Concise debug observer for pipecat-adk pipelines.
 
 Logs frame activity at INFO level. Add to PipelineTask observers=[AdkDebugObserver()].
+Uses Vql-prefixed frame types (VqlContextFrame, VqlLLMFullResponseStartFrame, VqlLLMTextFrame).
 """
 
 from dataclasses import fields, is_dataclass
@@ -36,7 +37,7 @@ from pipecat.services.tts_service import TTSService
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 
-from pipecat_adk.frames import AdkContextFrame, AdkLLMFullResponseStartFrame, AdkLLMTextFrame
+from pipecat_adk.frames import VqlContextFrame, VqlLLMFullResponseStartFrame, VqlLLMTextFrame
 
 
 class FrameEndpoint(Enum):
@@ -64,12 +65,12 @@ class AdkDebugObserver(BaseObserver):
         LLMFullResponseEndFrame: {"id"},
         TranscriptionFrame: {"id", "text"},
         TTSTextFrame: {"id", "text"},
-        # ADK frames — AdkLLMFullResponseStartFrame before LLMFullResponseStartFrame
-        AdkLLMFullResponseStartFrame: {"id", "invocation_id"},
+        # Vql frames — VqlLLMFullResponseStartFrame before LLMFullResponseStartFrame
+        VqlLLMFullResponseStartFrame: {"id", "turn_id"},
         LLMFullResponseStartFrame: {"id"},
-        AdkContextFrame: {"id", "invocation_id"},
-        # AdkLLMTextFrame before LLMTextFrame (subclass before parent)
-        AdkLLMTextFrame: {"id", "text", "invocation_id"},
+        VqlContextFrame: {"id", "turn_id", "text"},
+        # VqlLLMTextFrame before LLMTextFrame (subclass before parent)
+        VqlLLMTextFrame: {"id", "text", "turn_id"},
         LLMTextFrame: {"id", "text"},
         InputTransportMessageFrame: {"id", "message"},
     }
@@ -83,13 +84,13 @@ class AdkDebugObserver(BaseObserver):
         BotStoppedSpeakingFrame: (BaseOutputTransport, FrameEndpoint.SOURCE),
         TranscriptionFrame: (STTService, FrameEndpoint.SOURCE),
         InterruptionFrame: (BaseInputTransport, FrameEndpoint.SOURCE),
-        # AdkLLMTextFrame before LLMTextFrame so isinstance() hits the subclass first
-        AdkLLMTextFrame: (LLMService, FrameEndpoint.SOURCE),
-        AdkLLMFullResponseStartFrame: (LLMService, FrameEndpoint.SOURCE),
+        # VqlLLMTextFrame before LLMTextFrame so isinstance() hits the subclass first
+        VqlLLMTextFrame: (LLMService, FrameEndpoint.SOURCE),
+        VqlLLMFullResponseStartFrame: (LLMService, FrameEndpoint.SOURCE),
         LLMTextFrame: (LLMService, FrameEndpoint.SOURCE),
         LLMFullResponseStartFrame: (LLMService, FrameEndpoint.SOURCE),
         LLMFullResponseEndFrame: (LLMService, FrameEndpoint.SOURCE),
-        AdkContextFrame: None,
+        VqlContextFrame: None,
         FunctionCallsStartedFrame: (LLMService, FrameEndpoint.SOURCE),
         FunctionCallInProgressFrame: (LLMService, FrameEndpoint.SOURCE),
         FunctionCallResultFrame: (LLMService, FrameEndpoint.SOURCE),

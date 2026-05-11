@@ -1,31 +1,39 @@
 from .aggregators import (
-    AdkAssistantContextAggregator,
-    AdkContextAggregatorPair,
-    AdkUserContextAggregator,
+    VqlAssistantContextAggregator,
+    VqlContextAggregatorPair,
+    VqlUserContextAggregator,
 )
-from .frames import AdkContextFrame, AdkLLMFullResponseStartFrame, AdkLLMTextFrame
+from .frames import (
+    VqlContextFrame,
+    VqlInterruptionFrame,
+    VqlLLMFullResponseStartFrame,
+    VqlLLMTextFrame,
+    VqlTurnCompletedFrame,
+)
 from .interruption import AdkInterruptionPlugin
-from .service import AdkBasedLLMService
-from .tts_mixin import AdkTTSMixin
+from .service import AdkLLMService
+from .tts_mixin import VqlTTSMixin
 from .types import SessionParams
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
-    # Core service
-    "AdkBasedLLMService",
-    # Aggregators
-    "AdkUserContextAggregator",
-    "AdkAssistantContextAggregator",
-    "AdkContextAggregatorPair",
-    # Plugin
+    # Core ADK service (ADK-specific, owns session + invocation_id)
+    "AdkLLMService",
+    # Vql aggregators (pipecat layer, no ADK internals)
+    "VqlUserContextAggregator",
+    "VqlAssistantContextAggregator",
+    "VqlContextAggregatorPair",
+    # Vql frames (pipecat layer)
+    "VqlContextFrame",
+    "VqlInterruptionFrame",
+    "VqlLLMFullResponseStartFrame",
+    "VqlLLMTextFrame",
+    "VqlTurnCompletedFrame",
+    # ADK plugin (ADK-specific)
     "AdkInterruptionPlugin",
-    # Frames
-    "AdkContextFrame",
-    "AdkLLMFullResponseStartFrame",
-    "AdkLLMTextFrame",
-    # TTS mixin
-    "AdkTTSMixin",
-    # Types
+    # Vql TTS mixin (pipecat layer)
+    "VqlTTSMixin",
+    # ADK types
     "SessionParams",
 ]

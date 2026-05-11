@@ -1,44 +1,92 @@
-"""Frame definitions for the ADK-Pipecat bridge."""
+"""Frame definitions for the Vql-Pipecat bridge.
 
-from dataclasses import dataclass
+Vql-prefixed frames are the pipecat-layer abstractions that flow between
+VqlUserContextAggregator, the LLM service, VqlTTSMixin, and
+VqlAssistantContextAggregator.  They carry turn_id but never expose ADK
+internals (invocation_id stays private to AdkLLMService).
+"""
 
-from pipecat.frames.frames import LLMFullResponseStartFrame, LLMTextFrame, SystemFrame
+from dataclasses import dataclass, field
+
+from pipecat.frames.frames import (
+    InterruptionFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
+    SystemFrame,
+)
 
 
 @dataclass
-class AdkContextFrame(SystemFrame):
-    """Carries invocation_id from user aggregator to LLM service.
+class VqlContextFrame(SystemFrame):
+    """Carries turn_id and user text from user aggregator to LLM service.
 
-    Pushed by AdkUserContextAggregator after persisting the user event.
-    AdkBasedLLMService handles it by calling runner.run_async(invocation_id=...).
+    VqlUserContextAggregator pushes this after a user turn completes.
+    AdkLLMService handles it by building the ADK Content and calling
+    runner.run_async(new_message=content).
     """
 
-    invocation_id: str
+    turn_id: str = ""
+    text: str = ""
 
 
 @dataclass
-class AdkLLMFullResponseStartFrame(LLMFullResponseStartFrame):
-    """LLMFullResponseStartFrame carrying the ADK invocation_id.
+class VqlInterruptionFrame(InterruptionFrame):
+    """InterruptionFrame annotated with the turn_id that is being interrupted.
 
-    Pushed by AdkBasedLLMService at the start of each runner.run_async call.
-    AdkTTSMixin uses invocation_id to pin the TTS context_id, creating the
-    provenance chain: invocation_id → TTS context_id → TTSTextFrame.context_id.
+    Broadcast by VqlUserContextAggregator in _on_user_turn_started instead of
+    the plain InterruptionFrame.  Carries the *previous* turn's turn_id so that
+    VqlAssistantContextAggregator can attribute the partial [HEARD] text to the
+    correct turn without storing any state of its own.
     """
 
-    invocation_id: str = ""
+    turn_id: str = ""
 
 
 @dataclass
-class AdkLLMTextFrame(LLMTextFrame):
-    """LLMTextFrame carrying the ADK invocation_id; excluded from LLMContext.
+class VqlLLMFullResponseStartFrame(LLMFullResponseStartFrame):
+    """LLMFullResponseStartFrame carrying the pipecat-layer turn_id.
+
+    Pushed by AdkLLMService at the start of each runner.run_async response.
+    VqlTTSMixin reads turn_id to pin _turn_context_id, creating the provenance
+    chain: turn_id → TTS context_id → TTSTextFrame.context_id → TTSStoppedFrame.context_id.
+
+    invocation_id is intentionally absent — it is ADK-internal and lives only
+    in AdkLLMService._turn_invocation_map.
+    """
+
+    turn_id: str = ""
+
+
+@dataclass
+class VqlLLMTextFrame(LLMTextFrame):
+    """LLMTextFrame carrying the pipecat-layer turn_id; excluded from LLMContext.
 
     append_to_context=False prevents LLMAssistantAggregator from accumulating
     this frame — only TTSTextFrame (actually-played audio) contributes to the
-    assistant context via AdkAssistantContextAggregator's per-invocation map.
+    assistant context via VqlAssistantContextAggregator.
     """
 
-    invocation_id: str = ""
+    turn_id: str = ""
 
     def __post_init__(self):
         super().__post_init__()
         self.append_to_context = False
+
+
+@dataclass
+class VqlTurnCompletedFrame(SystemFrame):
+    """Upstream signal from VqlAssistantContextAggregator to AdkLLMService.
+
+    Pushed upstream when a bot turn finishes (cleanly or interrupted).
+    AdkLLMService uses turn_id to look up the ADK invocation_id and, when
+    interrupted=True, writes the [HEARD] event to the ADK session.
+
+    Fields:
+        turn_id:     The pipecat turn identifier for this completed turn.
+        text:        The text that was actually spoken (from accumulated TTSTextFrame).
+        interrupted: True if user interrupted mid-turn; False for clean completion.
+    """
+
+    turn_id: str = ""
+    text: str = ""
+    interrupted: bool = False

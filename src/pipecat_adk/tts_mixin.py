@@ -1,51 +1,63 @@
-"""AdkTTSMixin: pins TTS context_id to ADK invocation_id for provenance tracking."""
+"""VqlTTSMixin: pins TTS _turn_context_id to the Vql turn_id.
 
-from typing import Optional
+Pipecat's TTSService normally calls create_context_id() on every
+LLMFullResponseStartFrame to generate a fresh UUID for the turn.  This mixin
+overrides that block to use VqlLLMFullResponseStartFrame.turn_id instead, so
+context_id == turn_id throughout the TTS/transport/aggregator pipeline.
 
+Usage::
+
+    class MyTTSService(VqlTTSMixin, ElevenLabsTTSService):
+        pass
+
+No new member variables are introduced.  The existing _turn_context_id
+attribute (owned by pipecat's TTSService) is set directly from the frame.
+"""
+
+from pipecat.frames.frames import LLMFullResponseStartFrame
 from pipecat.processors.frame_processor import FrameDirection
 
-from .frames import AdkLLMFullResponseStartFrame
+from .frames import VqlLLMFullResponseStartFrame
 
 
-class AdkTTSMixin:
-    """Mixin for TTS services that pins _turn_context_id to the ADK invocation_id.
+class VqlTTSMixin:
+    """Mixin for TTS services that pins _turn_context_id to the Vql turn_id.
 
-    Apply to any concrete TTS service:
+    Apply before the concrete TTS service in the MRO:
 
-        class MyTTSService(AdkTTSMixin, ElevenLabsTTSService):
+        class AdkGoogleTTSService(VqlTTSMixin, GoogleTTSService):
             pass
 
-    When AdkBasedLLMService pushes AdkLLMFullResponseStartFrame(invocation_id="inv1"),
-    this mixin sets _turn_context_id = "inv1" instead of generating a UUID. All
-    TTSTextFrame and TTSAudioRawFrame instances for that response carry
-    context_id = "inv1", enabling AdkAssistantContextAggregator to correlate
-    played audio with the originating ADK invocation.
+    When AdkLLMService pushes VqlLLMFullResponseStartFrame(turn_id="t1"),
+    this mixin intercepts it and sets self._turn_context_id = "t1" directly,
+    bypassing create_context_id().  All TTSTextFrame and TTSAudioRawFrame
+    instances for that response carry context_id == turn_id, enabling
+    VqlAssistantContextAggregator to receive the turn_id via TTSStoppedFrame
+    without storing any state of its own.
 
-    TTSSpeakFrame audio is unaffected: TTSSpeakFrame temporarily clears
-    _turn_context_id and generate_context_id generates a fresh UUID, which is
-    never registered in the aggregator's _invocations map and is silently ignored.
+    create_context_id() is effectively dead code for the LLM-response path.
+    It may still be called for TTSSpeakFrame-driven utterances; that is safe
+    because those utterances are not tracked by VqlAssistantContextAggregator.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._pending_adk_invocation_id: Optional[str] = None
-
     async def process_frame(self, frame, direction: FrameDirection) -> None:
-        if (
-            isinstance(frame, AdkLLMFullResponseStartFrame)
-            and frame.invocation_id
-            and direction == FrameDirection.DOWNSTREAM
-        ):
-            self._pending_adk_invocation_id = frame.invocation_id
-        await super().process_frame(frame, direction)
-        if isinstance(frame, AdkLLMFullResponseStartFrame):
-            self._pending_adk_invocation_id = None
-
-    def create_context_id(self) -> str:
-        # On a new turn (_turn_context_id is None) for an ADK invocation: use
-        # invocation_id as context_id. The check `not self._turn_context_id`
-        # ensures TTSSpeakFrame calls (which reset _turn_context_id) fall through
-        # to super() and get a fresh UUID.
-        if self._pending_adk_invocation_id and not self._turn_context_id:
-            return self._pending_adk_invocation_id
-        return super().create_context_id()
+        if isinstance(frame, LLMFullResponseStartFrame):
+            # COPIED from TTSService.process_frame LLMFullResponseStartFrame branch
+            # @ pipecat 06233f53e (tts_service.py:681-686)
+            # CHANGED: assert frame is VqlLLMFullResponseStartFrame — this mixin
+            #          requires AdkLLMService to be the LLM service; set
+            #          self._turn_context_id = frame.turn_id instead of calling
+            #          create_context_id(), which makes turn_id the canonical TTS
+            #          context id for the entire downstream pipeline.
+            if not isinstance(frame, VqlLLMFullResponseStartFrame):
+                raise RuntimeError(
+                    f"VqlTTSMixin requires VqlLLMFullResponseStartFrame but received "
+                    f"{type(frame).__name__}.  Ensure AdkLLMService (or another Vql "
+                    f"LLM service) is used in this pipeline."
+                )
+            self._llm_response_started = True  # type: ignore[attr-defined]
+            self._turn_context_id = frame.turn_id  # type: ignore[attr-defined]
+            await self.on_turn_context_created(self._turn_context_id)  # type: ignore[attr-defined]
+            await self.push_frame(frame, direction)
+        else:
+            await super().process_frame(frame, direction)  # type: ignore[misc]

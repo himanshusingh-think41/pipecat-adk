@@ -52,7 +52,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.frameworks.rtvi import (
-    RTVIConfig,
     RTVIObserver,
     RTVIProcessor,
 )
@@ -68,7 +67,7 @@ from pipecat.utils.time import time_now_iso8601
 
 from google.adk.apps import App
 from google.adk.sessions import InMemorySessionService
-from pipecat_adk import AdkBasedLLMService, AdkTTSMixin, SessionParams
+from pipecat_adk import AdkLLMService, VqlTTSMixin, SessionParams
 
 
 # ============================================================================
@@ -649,7 +648,7 @@ class MockOutputTransport(BaseOutputTransport):
 # MockTTSService
 # ============================================================================
 
-class MockTTSService(AdkTTSMixin, TTSService):
+class MockTTSService(VqlTTSMixin, TTSService):
     """Mock TTS: encodes text as padded UTF-8 audio chunks.
 
     Follows the HTTP TTS pattern used by real pipecat services (OpenAI,
@@ -820,7 +819,7 @@ class TestRunner:
         self.mock_output = self.transport.output()
         self._bot_output = self.transport.bot_output()
 
-        self.adk_service = AdkBasedLLMService(
+        self.adk_service = AdkLLMService(
             agent=app.root_agent,
             session_service=self.session_service,
             session_params=self.session_params,
@@ -842,7 +841,7 @@ class TestRunner:
             user_params=user_params
         )
 
-        self._rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+        self._rtvi = RTVIProcessor()
 
         self.pipeline = Pipeline([
             self.mock_input,

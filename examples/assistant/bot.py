@@ -26,7 +26,7 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
 from pipecat.frames.frames import LLMRunFrame
 
-from pipecat_adk import AdkBasedLLMService, AdkTTSMixin, SessionParams
+from pipecat_adk import AdkLLMService, VqlTTSMixin, SessionParams
 from agent import app
 from debug_observer import AdkDebugObserver
 
@@ -36,8 +36,8 @@ logger.remove(0)
 logger.add(sys.stderr, level="INFO")
 
 
-class AdkGoogleTTSService(AdkTTSMixin, GoogleTTSService):
-    """GoogleTTSService with ADK invocation_id pinning for [HEARD] tracking."""
+class AdkGoogleTTSService(VqlTTSMixin, GoogleTTSService):
+    """GoogleTTSService with Vql turn_id pinning for [HEARD] tracking."""
     pass
 
 
@@ -63,8 +63,7 @@ async def run_bot(webrtc_connection):
         await session_service.create_session(**session_params.model_dump())
 
     # Create ADK-based LLM service with the app from agent.py.
-    # app already has ResumabilityConfig set — required by AdkBasedLLMService.
-    llm = AdkBasedLLMService(
+    llm = AdkLLMService(
         session_service=session_service,
         session_params=session_params,
         app=app,
@@ -83,8 +82,9 @@ async def run_bot(webrtc_connection):
         )
     )
 
-    # Create TTS service — AdkGoogleTTSService pins context_id to invocation_id
-    # so AdkAssistantContextAggregator can track what was spoken for [HEARD] events.
+    # Create TTS service — VqlTTSMixin pins context_id to turn_id so
+    # VqlAssistantContextAggregator can pass turn_id via TTSStoppedFrame
+    # without storing any state.
     tts = AdkGoogleTTSService(
         voice_id="en-IN-Chirp3-HD-Achird",
         params=GoogleTTSService.InputParams(language=Language.EN_IN),
@@ -114,7 +114,7 @@ async def run_bot(webrtc_connection):
             llm,  # ADK agent
             tts,  # Text-to-speech
             transport.output(),  # Audio output to user
-            context_aggregator.assistant(),  # Handle interruptions
+            context_aggregator.assistant(),  # Track what was spoken; push VqlTurnCompletedFrame
         ]
     )
 

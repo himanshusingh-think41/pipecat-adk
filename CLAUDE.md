@@ -21,11 +21,11 @@ uv run python -m unittest tests.test_with_mocks.TestWithMocks.test_basic_interac
 
 | File | Key abstraction |
 |------|----------------|
-| `service.py` | `AdkBasedLLMService` — receives `AdkContextFrame`, calls `runner.run_async(invocation_id)`, converts ADK events to Pipecat frames |
-| `aggregators.py` | `AdkUserContextAggregator` — persists user event to ADK, pushes `AdkContextFrame`; `AdkAssistantContextAggregator` — accumulates spoken text this turn, writes `[HEARD]` on interruption, clears on `BotStoppedSpeakingFrame` |
+| `service.py` | `AdkLLMService` — receives `VqlContextFrame(turn_id, text)`, calls `runner.run_async(new_message=content)`, maps `turn_id → invocation_id`, converts ADK events to Vql frames, writes `[HEARD]` events on interruption |
+| `aggregators.py` | `VqlUserContextAggregator` — mints `turn_id`, pushes `VqlContextFrame`; `VqlAssistantContextAggregator` — accumulates spoken TTS text, pushes `VqlTurnCompletedFrame` upstream when turn ends |
 | `interruption.py` | `AdkInterruptionPlugin` — `before_model_callback` finds `[HEARD]` markers, truncates preceding model event, removes marker |
-| `tts_mixin.py` | `AdkTTSMixin` — overrides `create_context_id()` to return the ADK `invocation_id`; required for `[HEARD]` tracking |
-| `frames.py` | `AdkContextFrame(invocation_id)` |
+| `tts_mixin.py` | `VqlTTSMixin` — intercepts `VqlLLMFullResponseStartFrame`, sets `_turn_context_id = frame.turn_id`; required for `[HEARD]` tracking |
+| `frames.py` | `VqlContextFrame(turn_id, text)`, `VqlInterruptionFrame(turn_id)`, `VqlLLMFullResponseStartFrame(turn_id)`, `VqlLLMTextFrame(text, turn_id)`, `VqlTurnCompletedFrame(turn_id, text, interrupted)` |
 | `types.py` | `SessionParams(app_name, user_id, session_id)` |
 
 Extension points: `_build_user_event`, `_on_state_delta`, `_persist_and_run` — see [docs/architecture.md](docs/architecture.md).
@@ -34,7 +34,7 @@ Extension points: `_build_user_event`, `_on_state_delta`, `_persist_and_run` —
 
 ### ADK owns context, not Pipecat
 
-`AdkUserContextAggregator.push_aggregation` persists directly to ADK and skips `LLMContext` entirely (`super()` is not called). Consequence: Pipecat's ecosystem components that read `LLMContext` (`LLM Log Observer`, `Mem0`, `IVR Navigator`) won't see messages. Access history via `session_service.get_session()`.
+`VqlUserContextAggregator.push_aggregation` pushes a `VqlContextFrame` and skips `LLMContext` entirely. `AdkLLMService` calls `runner.run_async(new_message=content)` directly. Consequence: Pipecat's ecosystem components that read `LLMContext` (`LLM Log Observer`, `Mem0`, `IVR Navigator`) won't see messages. Access history via `session_service.get_session()`.
 
 ### Accountant's approach to interruptions
 
@@ -42,32 +42,32 @@ ADK commits the full response immediately — audit trail preserved, tool calls 
 
 ### [HEARD] is exact, not fuzzy
 
-Heard text is sourced directly from `TTSTextFrame.text` frames that passed through the pipeline — no difflib, no ASR re-comparison. At turn end, `AdkAssistantContextAggregator` knows whether the turn was interrupted (`InterruptionFrame`) or clean (`BotStoppedSpeakingFrame`), and acts accordingly: write `[HEARD]` or just clear the buffer.
+Heard text is sourced directly from `TTSTextFrame.text` frames that passed through the pipeline — no difflib, no ASR re-comparison. `VqlAssistantContextAggregator` pushes `VqlTurnCompletedFrame(interrupted=True/False)` upstream; `AdkLLMService` decides whether to write `[HEARD]` based on the `interrupted` flag and the accumulated text.
 
-### AdkTTSMixin is required for [HEARD] tracking
+### VqlTTSMixin is required for [HEARD] tracking
 
-`AdkAssistantContextAggregator` correlates `TTSTextFrame.context_id` with ADK `invocation_id` to know which spoken text belongs to which turn. Standard TTS services generate a random UUID for `context_id` each turn, so the aggregator can never match them. `AdkTTSMixin` overrides `create_context_id()` to return `invocation_id` instead. **Always apply `AdkTTSMixin` to your TTS service** — without it, `[HEARD]` events are never written and interruption handling silently degrades.
+`VqlAssistantContextAggregator` reads `turn_id` from `TTSStoppedFrame.context_id` (clean turns) or `VqlInterruptionFrame.turn_id` (interrupted turns). Standard TTS services generate a random UUID for `context_id` each turn, so the aggregator's `TTSStoppedFrame.context_id` would never match any known turn_id. `VqlTTSMixin` intercepts `VqlLLMFullResponseStartFrame` and sets `_turn_context_id = frame.turn_id`, so the TTS base class stamps the right turn_id onto all subsequent frames. **Always apply `VqlTTSMixin` to your TTS service** — without it, `VqlTurnCompletedFrame` will never be pushed and `[HEARD]` events are never written.
 
 ```python
-class AdkGoogleTTSService(AdkTTSMixin, GoogleTTSService):
+class MyGoogleTTSService(VqlTTSMixin, GoogleTTSService):
     pass
 ```
 
-### Stale session double-reload in push_aggregation
+### turn_id and invocation_id are separate
 
-`AdkUserContextAggregator.push_aggregation` loads the session twice: once to pass to `_build_user_event` (which may read `session.state`), and again immediately before `session_service.append_event`. The second reload is necessary because `runner.run_async` from a concurrent invocation may advance `_storage_update_marker` between the first load and the append, causing a stale-session rejection. The extra round-trip is cheap; the failure mode without it is silent data loss.
+`turn_id` is a UUID hex minted by `VqlUserContextAggregator` on the pipecat layer. `invocation_id` is generated by ADK when `runner.run_async` is called. `AdkLLMService` maps `turn_id → invocation_id` in `_turn_invocation_map`. No other component knows both IDs. See [docs/turn-id-propagation.md](docs/turn-id-propagation.md).
+
+### runner.run_async with new_message — no pre-persist, no ResumabilityConfig
+
+We call `runner.run_async(new_message=content)` directly. ADK persists the event and generates `invocation_id` as part of the same call. There is no pre-persist step, no `invocation_id` pre-generation, and no `ResumabilityConfig` requirement.
 
 ### Function call frames: both directions
 
-`AdkBasedLLMService._handle_function_call` pushes `FunctionCallsStartedFrame` and `FunctionCallInProgressFrame` both `UPSTREAM` and `DOWNSTREAM`. Upstream: `STTMuteFilter` needs to mute mic during tool execution. Downstream: UI needs "thinking..." indicators.
-
-### Pre-persisting user events and ResumabilityConfig
-
-We persist the user event to ADK *before* calling `runner.run_async`, then resume via `invocation_id` — this enables `_build_user_event` to enrich events with contextual data before they enter the session journal, and requires `ResumabilityConfig(is_resumable=True)` which ADK enforces as a hard constraint. See [docs/invocation-id-and-resumability.md](docs/invocation-id-and-resumability.md).
+`AdkLLMService._handle_function_call` pushes `FunctionCallsStartedFrame` and `FunctionCallInProgressFrame` both `UPSTREAM` and `DOWNSTREAM`. Upstream: `STTMuteFilter` needs to mute mic during tool execution. Downstream: UI needs "thinking..." indicators.
 
 ### Function call frames blocked from LLMContext
 
-`AdkAssistantContextAggregator` no-ops `_handle_function_call_in_progress/result/cancel`. ADK manages tool calls internally in its session; letting those frames into `LLMContext` produces malformed context entries.
+`VqlAssistantContextAggregator` no-ops `_handle_function_call_in_progress/result/cancel`. ADK manages tool calls internally in its session; letting those frames into `LLMContext` produces malformed context entries.
 
 ## Testing
 
@@ -85,7 +85,7 @@ async with TestRunner(app=app) as runner:   # app = App(name="agents", ...)
 | File | Coverage |
 |------|----------|
 | `test_with_mocks.py` | Integration flows: basic, interruption, function calls, multi-turn |
-| `test_components.py` | Unit tests for `AdkAssistantContextAggregator` [HEARD] logic |
+| `test_components.py` | Unit tests for `VqlAssistantContextAggregator` and `VqlUserContextAggregator` |
 | `test_plugin.py` | `AdkInterruptionPlugin` edge cases (12 tests) |
 | `test_utils.py` | `simplify_events()` |
 
@@ -94,8 +94,8 @@ async with TestRunner(app=app) as runner:   # app = App(name="agents", ...)
 ## Gotchas
 
 - ADK agent names require underscores: `name="my_agent"` not `name="my-agent"`
-- `AdkBasedLLMService` accepts either `app=App(...)` (full control) or `agent + plugins` (service builds App internally). Either way, the App **must** have `ResumabilityConfig(is_resumable=True)`.
-- `AdkTTSMixin` must be mixed into every TTS service used with this library, or `[HEARD]` events will never be written.
+- `AdkLLMService` accepts either `app=App(...)` (full control) or `agent + plugins` (service builds App internally).
+- `VqlTTSMixin` must be mixed into every TTS service used with this library, or `[HEARD]` events will never be written.
 - Use `DatabaseSessionService` for production — `InMemorySessionService` loses all history on restart. Both require creating the session before starting the pipeline.
 
 ## Dependencies
