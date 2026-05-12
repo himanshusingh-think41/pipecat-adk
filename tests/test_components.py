@@ -64,7 +64,7 @@ class TestVqlAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         _, upstream = await run_test(
             aggregator,
             frames_to_send=[
-                VqlLLMFullResponseStartFrame(turn_id=turn_id),
+                VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id="test_inv"),
                 _tts_text("Hello world", turn_id),
                 _stopped(turn_id),
                 SleepFrame(sleep=0.05),
@@ -85,7 +85,7 @@ class TestVqlAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         _, upstream = await run_test(
             aggregator,
             frames_to_send=[
-                VqlLLMFullResponseStartFrame(turn_id=turn_id),
+                VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id="test_inv"),
                 _tts_text("Hello world", turn_id),
                 SleepFrame(sleep=0.05),
                 VqlInterruptionFrame(turn_id=turn_id),
@@ -107,7 +107,7 @@ class TestVqlAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         _, upstream = await run_test(
             aggregator,
             frames_to_send=[
-                VqlLLMFullResponseStartFrame(turn_id=turn_id),
+                VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id="test_inv"),
                 SleepFrame(sleep=0.05),
                 VqlInterruptionFrame(turn_id=turn_id),
                 SleepFrame(sleep=0.05),
@@ -125,7 +125,7 @@ class TestVqlAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         _, upstream = await run_test(
             aggregator,
             frames_to_send=[
-                VqlLLMFullResponseStartFrame(turn_id=turn_id),
+                VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id="test_inv"),
                 _stopped(turn_id),
                 SleepFrame(sleep=0.05),
             ],
@@ -142,7 +142,7 @@ class TestVqlAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         _, upstream = await run_test(
             aggregator,
             frames_to_send=[
-                VqlLLMFullResponseStartFrame(turn_id=turn_id),
+                VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id="test_inv"),
                 _tts_text("Hello", turn_id),
                 _tts_text(" world", turn_id),
                 _stopped(turn_id),
@@ -163,7 +163,7 @@ class TestVqlAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         _, upstream = await run_test(
             aggregator,
             frames_to_send=[
-                VqlLLMFullResponseStartFrame(turn_id=turn_id),
+                VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id="test_inv"),
                 _tts_text("First sentence.", turn_id),
                 _tts_text(" Second sentence.", turn_id),
                 SleepFrame(sleep=0.05),
@@ -186,7 +186,7 @@ class TestVqlAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         _, upstream = await run_test(
             aggregator,
             frames_to_send=[
-                VqlLLMFullResponseStartFrame(turn_id=turn_id),
+                VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id="test_inv"),
                 _tts_text("Hello", turn_id),
                 TTSStoppedFrame(),  # no context_id
                 SleepFrame(sleep=0.05),
@@ -204,7 +204,7 @@ class TestVqlAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         _, upstream = await run_test(
             aggregator,
             frames_to_send=[
-                VqlLLMFullResponseStartFrame(turn_id=turn_id),
+                VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id="test_inv"),
                 _tts_text("Some text", turn_id),
                 _stopped(turn_id),
                 SleepFrame(sleep=0.05),
@@ -223,7 +223,7 @@ class TestVqlAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         _, upstream = await run_test(
             aggregator,
             frames_to_send=[
-                VqlLLMFullResponseStartFrame(turn_id=turn_id),
+                VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id="test_inv"),
                 _tts_text("Some text", turn_id),
                 SleepFrame(sleep=0.05),
                 VqlInterruptionFrame(turn_id=turn_id),
@@ -247,7 +247,7 @@ class TestVqlAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         _, upstream = await run_test(
             aggregator,
             frames_to_send=[
-                VqlLLMFullResponseStartFrame(turn_id=turn_id),
+                VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id="test_inv"),
                 _tts_text("Hello world", turn_id),
                 _stopped(turn_id),    # clean turn — clears aggregation buffer
                 SleepFrame(sleep=0.05),

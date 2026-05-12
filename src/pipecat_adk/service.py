@@ -27,10 +27,6 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     FunctionCallFromLLM,
-    FunctionCallInProgressFrame,
-    FunctionCallResultFrame,
-    FunctionCallsStartedFrame,
-    LLMFullResponseEndFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -45,6 +41,10 @@ from .aggregators import (
 )
 from .frames import (
     VqlContextFrame,
+    VqlFunctionCallInProgressFrame,
+    VqlFunctionCallResultFrame,
+    VqlFunctionCallsStartedFrame,
+    VqlLLMFullResponseEndFrame,
     VqlLLMFullResponseStartFrame,
     VqlLLMTextFrame,
     VqlTurnCompletedFrame,
@@ -224,7 +224,6 @@ class AdkLLMService(LLMService):
             content: The user Content to pass as new_message.
             state_delta: Optional state changes forwarded to runner.run_async.
         """
-        await self.push_frame(VqlLLMFullResponseStartFrame(turn_id=turn_id))
         await self.start_ttfb_metrics()
         await self.start_processing_metrics()
 
@@ -233,6 +232,8 @@ class AdkLLMService(LLMService):
         total_tokens = 0
         cache_read_input_tokens = 0
         reasoning_tokens = 0
+        invocation_id = ""
+        start_frame_pushed = False
 
         try:
             ttfb_stopped = False
@@ -248,12 +249,20 @@ class AdkLLMService(LLMService):
                     ttfb_stopped = True
 
                 # Learn invocation_id from first event; store turn_id → invocation_id.
-                if event.invocation_id and turn_id not in self._turn_invocation_map:
-                    self._turn_invocation_map[turn_id] = event.invocation_id
+                if event.invocation_id and not invocation_id:
+                    invocation_id = event.invocation_id
+                    self._turn_invocation_map[turn_id] = invocation_id
                     logger.debug(
-                        f"ADK invocation_id={event.invocation_id!r} "
+                        f"ADK invocation_id={invocation_id!r} "
                         f"mapped to turn_id={turn_id!r}"
                     )
+
+                # Push start frame on first event so invocation_id is known.
+                if not start_frame_pushed:
+                    await self.push_frame(
+                        VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id=invocation_id)
+                    )
+                    start_frame_pushed = True
 
                 # Final event is authoritative for token counts (cumulative in SSE mode).
                 if event.usage_metadata and not event.partial:
@@ -263,7 +272,7 @@ class AdkLLMService(LLMService):
                     cache_read_input_tokens = event.usage_metadata.cached_content_token_count or 0
                     reasoning_tokens = event.usage_metadata.thoughts_token_count or 0
 
-                await self._push_frames_from_event(event, turn_id=turn_id)
+                await self._push_frames_from_event(event, turn_id=turn_id, invocation_id=invocation_id)
 
         except asyncio.TimeoutError as e:
             logger.warning(f"{self} ADK timeout: {e}")
@@ -273,6 +282,11 @@ class AdkLLMService(LLMService):
             logger.exception(f"{self} ADK error: {e}")
             await self.push_error(error_msg=f"ADK runner error: {e}", exception=e)
         finally:
+            # Guarantee a matched start/end pair even if the runner threw before yielding.
+            if not start_frame_pushed:
+                await self.push_frame(
+                    VqlLLMFullResponseStartFrame(turn_id=turn_id, invocation_id=invocation_id)
+                )
             await self.start_llm_usage_metrics(
                 LLMTokenUsage(
                     prompt_tokens=prompt_tokens,
@@ -283,9 +297,11 @@ class AdkLLMService(LLMService):
                 )
             )
             await self.stop_processing_metrics()
-            await self.push_frame(LLMFullResponseEndFrame())
+            await self.push_frame(
+                VqlLLMFullResponseEndFrame(turn_id=turn_id, invocation_id=invocation_id)
+            )
 
-    async def _push_frames_from_event(self, event: Event, *, turn_id: str) -> None:
+    async def _push_frames_from_event(self, event: Event, *, turn_id: str, invocation_id: str) -> None:
         """Convert one ADK event into Pipecat frames.
 
         State deltas are forwarded to _on_state_delta before any text frames.
@@ -307,13 +323,19 @@ class AdkLLMService(LLMService):
             if text_parts:
                 text = "".join(text_parts)
                 if text:
-                    await self.push_frame(VqlLLMTextFrame(text=text, turn_id=turn_id))
+                    await self.push_frame(
+                        VqlLLMTextFrame(text=text, turn_id=turn_id, invocation_id=invocation_id)
+                    )
 
         for part in event.content.parts:
             if part.function_call:
-                await self._handle_function_call(part.function_call)
+                await self._handle_function_call(
+                    part.function_call, turn_id=turn_id, invocation_id=invocation_id
+                )
             elif part.function_response:
-                await self._handle_function_response(part.function_response)
+                await self._handle_function_response(
+                    part.function_response, turn_id=turn_id, invocation_id=invocation_id
+                )
 
     # ------------------------------------------------------------------
     # Session write: [HEARD] events (only session-write in the library)
@@ -363,7 +385,7 @@ class AdkLLMService(LLMService):
     # Function call / response helpers
     # ------------------------------------------------------------------
 
-    async def _handle_function_call(self, func_call) -> None:
+    async def _handle_function_call(self, func_call, *, turn_id: str, invocation_id: str) -> None:
         assert func_call.id, "ADK function call must have an id"
         assert func_call.name, "ADK function call must have a name"
 
@@ -373,27 +395,35 @@ class AdkLLMService(LLMService):
             arguments=func_call.args or {},
             context=None,
         )
-        started = FunctionCallsStartedFrame(function_calls=[func_call_from_llm])
+        started = VqlFunctionCallsStartedFrame(
+            function_calls=[func_call_from_llm],
+            turn_id=turn_id,
+            invocation_id=invocation_id,
+        )
         await self.push_frame(started, FrameDirection.UPSTREAM)
         await self.push_frame(started, FrameDirection.DOWNSTREAM)
 
-        in_progress = FunctionCallInProgressFrame(
+        in_progress = VqlFunctionCallInProgressFrame(
             tool_call_id=func_call.id,
             function_name=func_call.name,
             arguments=func_call.args,
+            turn_id=turn_id,
+            invocation_id=invocation_id,
         )
         await self.push_frame(in_progress, FrameDirection.UPSTREAM)
         await self.push_frame(in_progress, FrameDirection.DOWNSTREAM)
 
-    async def _handle_function_response(self, func_response) -> None:
+    async def _handle_function_response(self, func_response, *, turn_id: str, invocation_id: str) -> None:
         assert func_response.id, "ADK function response must have an id"
         assert func_response.name, "ADK function response must have a name"
 
-        result = FunctionCallResultFrame(
+        result = VqlFunctionCallResultFrame(
             tool_call_id=func_response.id,
             function_name=func_response.name,
             arguments=None,
             result=func_response.response or {},
+            turn_id=turn_id,
+            invocation_id=invocation_id,
         )
         await self.push_frame(result, FrameDirection.UPSTREAM)
         await self.push_frame(result, FrameDirection.DOWNSTREAM)

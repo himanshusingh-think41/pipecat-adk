@@ -28,14 +28,14 @@ User speaks
       mint turn_id (UUID hex)
       push VqlContextFrame(turn_id, text)
   → AdkLLMService
-      push VqlLLMFullResponseStartFrame(turn_id)
       runner.run_async(new_message=Content(role="user", parts=[Part(text=text)]))
         first event → learn invocation_id, store turn_id → invocation_id in map
-        partial event with text → push VqlLLMTextFrame(text, turn_id)
-        function call → FunctionCallsStartedFrame + FunctionCallInProgressFrame (both directions)
-        function response → FunctionCallResultFrame (both directions)
+                      push VqlLLMFullResponseStartFrame(turn_id, invocation_id)
+        partial event with text → push VqlLLMTextFrame(text, turn_id, invocation_id)
+        function call → VqlFunctionCallsStartedFrame + VqlFunctionCallInProgressFrame (both directions)
+        function response → VqlFunctionCallResultFrame (both directions)
         state_delta → _on_state_delta(state_delta)
-      push LLMFullResponseEndFrame
+      push VqlLLMFullResponseEndFrame(turn_id, invocation_id)
   → TTS (must be wrapped with VqlTTSMixin)
       VqlLLMFullResponseStartFrame triggers mixin to set _turn_context_id = frame.turn_id
       TTSTextFrame(context_id=turn_id, text="sentence 1")
@@ -205,8 +205,12 @@ The stable extension surface:
 | `AdkLLMService._on_state_delta(state_delta)` | Override to push state to client |
 | `VqlContextAggregatorPair.user()` / `.assistant()` | Access the two aggregators |
 | `VqlTTSMixin` | Mixin for TTS services; intercepts `VqlLLMFullResponseStartFrame` to pin `turn_id` as TTS `context_id` for `[HEARD]` tracking |
-| `VqlLLMFullResponseStartFrame(turn_id)` | Signals start of a new Vql turn; consumed by `VqlTTSMixin` |
-| `VqlLLMTextFrame(text, turn_id)` | LLM text with turn provenance; `append_to_context=False` so parent aggregator never accumulates it |
+| `VqlLLMFullResponseStartFrame(turn_id, invocation_id)` | Signals start of a new Vql turn (pushed after first ADK event so `invocation_id` is known); consumed by `VqlTTSMixin` |
+| `VqlLLMFullResponseEndFrame(turn_id, invocation_id)` | Signals end of a Vql turn; always emitted even if the runner throws |
+| `VqlLLMTextFrame(text, turn_id, invocation_id)` | LLM text with turn provenance; `append_to_context=False` so parent aggregator never accumulates it |
+| `VqlFunctionCallsStartedFrame(function_calls, turn_id, invocation_id)` | Subclass of `FunctionCallsStartedFrame` with turn provenance |
+| `VqlFunctionCallInProgressFrame(..., turn_id, invocation_id)` | Subclass of `FunctionCallInProgressFrame` with turn provenance |
+| `VqlFunctionCallResultFrame(..., turn_id, invocation_id)` | Subclass of `FunctionCallResultFrame` with turn provenance |
 | `VqlTurnCompletedFrame(turn_id, text, interrupted)` | Pushed upstream when a turn ends; consumed by `AdkLLMService` to decide whether to write `[HEARD]` |
 
 Internal and not stable: `_run_adk`, `_push_frames_from_event`, `_write_heard_event`, `_turn_invocation_map`.

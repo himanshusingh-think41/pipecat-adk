@@ -5,7 +5,11 @@ from .aggregators import (
 )
 from .frames import (
     VqlContextFrame,
+    VqlFunctionCallInProgressFrame,
+    VqlFunctionCallResultFrame,
+    VqlFunctionCallsStartedFrame,
     VqlInterruptionFrame,
+    VqlLLMFullResponseEndFrame,
     VqlLLMFullResponseStartFrame,
     VqlLLMTextFrame,
     VqlTurnCompletedFrame,
@@ -26,7 +30,11 @@ __all__ = [
     "VqlContextAggregatorPair",
     # Vql frames (pipecat layer)
     "VqlContextFrame",
+    "VqlFunctionCallsStartedFrame",
+    "VqlFunctionCallInProgressFrame",
+    "VqlFunctionCallResultFrame",
     "VqlInterruptionFrame",
+    "VqlLLMFullResponseEndFrame",
     "VqlLLMFullResponseStartFrame",
     "VqlLLMTextFrame",
     "VqlTurnCompletedFrame",

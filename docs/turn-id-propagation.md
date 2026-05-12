@@ -18,10 +18,10 @@ VqlUserContextAggregator
 
 AdkLLMService
   receive VqlContextFrame
-  push VqlLLMFullResponseStartFrame(turn_id)
   call runner.run_async(new_message=...)
     learn invocation_id from first event
     store _turn_invocation_map[turn_id] = invocation_id
+    push VqlLLMFullResponseStartFrame(turn_id, invocation_id)
 
 VqlTTSMixin (applied to TTS service)
   intercept VqlLLMFullResponseStartFrame

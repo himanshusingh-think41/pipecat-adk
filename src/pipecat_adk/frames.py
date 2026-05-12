@@ -6,11 +6,15 @@ VqlAssistantContextAggregator.  They carry turn_id but never expose ADK
 internals (invocation_id stays private to AdkLLMService).
 """
 
-from dataclasses import dataclass
+from dataclasses import KW_ONLY, dataclass
 
 from pipecat.frames.frames import (
     Frame,
+    FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
+    FunctionCallsStartedFrame,
     InterruptionFrame,
+    LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
     SystemFrame,
@@ -32,8 +36,8 @@ class VqlContextFrame(Frame):
     cancels __process_frame_task — killing _run_adk() mid-stream.
     """
 
-    turn_id: str = ""
-    text: str = ""
+    turn_id: str
+    text: str
 
 
 @dataclass
@@ -46,38 +50,80 @@ class VqlInterruptionFrame(InterruptionFrame):
     correct turn without storing any state of its own.
     """
 
-    turn_id: str = ""
+    turn_id: str
 
 
 @dataclass
 class VqlLLMFullResponseStartFrame(LLMFullResponseStartFrame):
-    """LLMFullResponseStartFrame carrying the pipecat-layer turn_id.
+    """LLMFullResponseStartFrame carrying the pipecat-layer turn_id and ADK invocation_id.
 
-    Pushed by AdkLLMService at the start of each runner.run_async response.
+    Pushed by AdkLLMService after the first ADK event arrives (so invocation_id is known).
     VqlTTSMixin reads turn_id to pin _turn_context_id, creating the provenance
     chain: turn_id → TTS context_id → TTSTextFrame.context_id → TTSStoppedFrame.context_id.
 
-    invocation_id is intentionally absent — it is ADK-internal and lives only
-    in AdkLLMService._turn_invocation_map.
+    invocation_id is ADK-internal; only AdkLLMService and its Vql frames expose it.
     """
 
-    turn_id: str = ""
+    turn_id: str
+    invocation_id: str
+
+
+@dataclass
+class VqlLLMFullResponseEndFrame(LLMFullResponseEndFrame):
+    """LLMFullResponseEndFrame carrying the pipecat-layer turn_id and ADK invocation_id.
+
+    Pushed by AdkLLMService in the finally block of _run_adk after the runner finishes.
+    """
+
+    turn_id: str
+    invocation_id: str
 
 
 @dataclass
 class VqlLLMTextFrame(LLMTextFrame):
-    """LLMTextFrame carrying the pipecat-layer turn_id; excluded from LLMContext.
+    """LLMTextFrame carrying the pipecat-layer turn_id and ADK invocation_id; excluded from LLMContext.
 
     append_to_context=False prevents LLMAssistantAggregator from accumulating
     this frame — only TTSTextFrame (actually-played audio) contributes to the
     assistant context via VqlAssistantContextAggregator.
     """
 
-    turn_id: str = ""
+    turn_id: str
+    invocation_id: str
 
     def __post_init__(self):
         super().__post_init__()
         self.append_to_context = False
+
+
+@dataclass
+class VqlFunctionCallsStartedFrame(FunctionCallsStartedFrame):
+    """FunctionCallsStartedFrame carrying the pipecat-layer turn_id and ADK invocation_id."""
+
+    turn_id: str
+    invocation_id: str
+
+
+@dataclass
+class VqlFunctionCallInProgressFrame(FunctionCallInProgressFrame):
+    """FunctionCallInProgressFrame carrying the pipecat-layer turn_id and ADK invocation_id."""
+
+    # KW_ONLY sentinel: parent has optional fields (cancel_on_interruption, group_id),
+    # so turn_id/invocation_id must be keyword-only to avoid non-default-after-default error.
+    _: KW_ONLY
+    turn_id: str
+    invocation_id: str
+
+
+@dataclass
+class VqlFunctionCallResultFrame(FunctionCallResultFrame):
+    """FunctionCallResultFrame carrying the pipecat-layer turn_id and ADK invocation_id."""
+
+    # KW_ONLY sentinel: parent has optional fields (run_llm, properties),
+    # so turn_id/invocation_id must be keyword-only to avoid non-default-after-default error.
+    _: KW_ONLY
+    turn_id: str
+    invocation_id: str
 
 
 @dataclass
@@ -94,6 +140,6 @@ class VqlTurnCompletedFrame(SystemFrame):
         interrupted: True if user interrupted mid-turn; False for clean completion.
     """
 
-    turn_id: str = ""
+    turn_id: str
     text: str = ""
     interrupted: bool = False
