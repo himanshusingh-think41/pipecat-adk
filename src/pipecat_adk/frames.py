@@ -9,6 +9,7 @@ internals (invocation_id stays private to AdkLLMService).
 from dataclasses import dataclass, field
 
 from pipecat.frames.frames import (
+    Frame,
     InterruptionFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
@@ -17,12 +18,18 @@ from pipecat.frames.frames import (
 
 
 @dataclass
-class VqlContextFrame(SystemFrame):
+class VqlContextFrame(Frame):
     """Carries turn_id and user text from user aggregator to LLM service.
 
     VqlUserContextAggregator pushes this after a user turn completes.
     AdkLLMService handles it by building the ADK Content and calling
     runner.run_async(new_message=content).
+
+    Must be a plain Frame (not SystemFrame) so that it is routed through
+    __process_frame_task rather than processed inline in __input_frame_task.
+    This allows VqlInterruptionFrame (a SystemFrame) to be handled by
+    __input_frame_task concurrently, which calls _start_interruption() and
+    cancels __process_frame_task — killing _run_adk() mid-stream.
     """
 
     turn_id: str = ""

@@ -447,33 +447,43 @@ class TestCriticalPaths(unittest.IsolatedAsyncioTestCase):
 
 
 class TestInterruptionCancellation(unittest.IsolatedAsyncioTestCase):
-    """Regression suite for ADK runner cancellation on interruption."""
+    """Regression suite for ADK runner cancellation on interruption.
 
-    @unittest.expectedFailure
+    Bypasses TTS/STT/transport entirely: frames are injected directly into the
+    pipeline task so there is no timing dependency on audio playback or VAD.
+    """
+
     async def test_adk_runner_cancelled_on_interruption(self):
-        """ADK runner must stop immediately when the user interrupts mid-response.
+        """VqlInterruptionFrame must cancel an in-flight _run_adk() call.
 
-        Root cause: VqlContextFrame extends SystemFrame, so it is processed inline
-        in __input_frame_task.  While _run_adk() is executing there, any arriving
-        VqlInterruptionFrame queues in __input_queue and cannot be handled until
-        _run_adk() finishes — the runner is never cancelled.
+        Regression test: VqlContextFrame must extend plain Frame (not SystemFrame)
+        so it is routed to __process_frame_task (the cancellable task).
+        VqlInterruptionFrame (a SystemFrame) is handled inline in __input_frame_task,
+        calls _start_interruption(), and cancels __process_frame_task — killing
+        _run_adk() mid-stream.
 
         Fix: change VqlContextFrame to extend plain Frame (matching pipecat's own
-        LLMContextFrame).  VqlContextFrame then goes through __process_frame_task
-        (the cancellable task).  When VqlInterruptionFrame arrives, __input_frame_task
-        processes it inline, calls _start_interruption(), and cancels __process_frame_task,
-        killing _run_adk() mid-stream.
+        LLMContextFrame).  VqlContextFrame then goes to __process_frame_task (the
+        cancellable task).  VqlInterruptionFrame (still a SystemFrame) is handled
+        by __input_frame_task concurrently; it calls _start_interruption() which
+        cancels __process_frame_task, injecting CancelledError into _run_adk().
 
-        The test opens the race window by using a slow LLM (CHUNK_DELAY between
-        partial events) so the interrupt fires while the first-turn runner is still
-        streaming.  It then asserts that fewer than NUM_CHUNKS events were yielded
-        (runner was cancelled early).  With the bug all NUM_CHUNKS events are yielded
-        before the interrupt is handled.
+        Setup: minimal Pipeline([AdkLLMService]).  Frames are injected directly
+        via task.queue_frame() — no TTS, STT, or transport involved.
         """
-        CHUNK_DELAY = 0.4   # seconds between partial chunks; full response ≈ CHUNK_DELAY × NUM_CHUNKS
-        NUM_CHUNKS = 5       # first turn emits this many slow partials → ~2 s without cancel
+        from uuid import uuid4
+        from google.adk.sessions import InMemorySessionService
+        from pipecat.pipeline.pipeline import Pipeline
+        from pipecat.pipeline.runner import PipelineRunner
+        from pipecat.pipeline.task import PipelineParams, PipelineTask
+        from pipecat_adk import AdkLLMService, SessionParams
+        from pipecat_adk.frames import VqlContextFrame, VqlInterruptionFrame
 
-        chunks_yielded = [0]  # list avoids nonlocal in nested async-generator class
+        CHUNK_DELAY = 0.3   # seconds between chunks; full response ≈ CHUNK_DELAY × NUM_CHUNKS
+        NUM_CHUNKS = 6       # total slow partials → ~1.8 s if not cancelled
+
+        chunks_yielded = [0]
+        first_chunk_event = asyncio.Event()   # set after chunk 1 is yielded
 
         class SlowLLM(MockLLM):
             @override
@@ -482,81 +492,79 @@ class TestInterruptionCancellation(unittest.IsolatedAsyncioTestCase):
             ) -> AsyncGenerator[LlmResponse, None]:
                 self.response_index += 1
                 self.requests.append(llm_request)
-
                 if self.response_index >= len(self.responses):
                     return
-
                 parts = self.responses[self.response_index]
-
-                if self.response_index == 0:
-                    # First turn: stream NUM_CHUNKS slow partials so the interrupt can land
-                    # while the runner is still inside runner.run_async().
-                    text = (parts[0].text or "") if parts else ""
-                    chunk_size = max(1, len(text) // NUM_CHUNKS)
-                    for i in range(0, len(text), chunk_size):
-                        chunk = text[i : i + chunk_size]
-                        yield LlmResponse(
-                            content=Content(role="model", parts=[Part.from_text(text=chunk)]),
-                            partial=True,
-                        )
-                        chunks_yielded[0] += 1
-                        await asyncio.sleep(CHUNK_DELAY)
-                    yield LlmResponse(content=Content(role="model", parts=parts), partial=None)
+                text = (parts[0].text or "") if parts else ""
+                chunk_size = max(1, len(text) // NUM_CHUNKS)
+                for i in range(0, len(text), chunk_size):
+                    chunk = text[i : i + chunk_size]
+                    yield LlmResponse(
+                        content=Content(role="model", parts=[Part.from_text(text=chunk)]),
+                        partial=True,
+                    )
                     chunks_yielded[0] += 1
-                else:
-                    # Subsequent turns: fast streaming (mirrors MockLLM behaviour)
-                    for part in parts:
-                        if hasattr(part, "text") and part.text:
-                            for chunk in self._split_text_for_streaming(part.text):
-                                yield LlmResponse(
-                                    content=Content(
-                                        role="model", parts=[Part.from_text(text=chunk)]
-                                    ),
-                                    partial=True,
-                                )
-                            yield LlmResponse(
-                                content=Content(role="model", parts=[part]), partial=None
-                            )
-                        else:
-                            yield LlmResponse(content=Content(role="model", parts=[part]))
+                    first_chunk_event.set()          # signal that LLM is now mid-stream
+                    await asyncio.sleep(CHUNK_DELAY)  # hold here so interrupt can arrive
+                yield LlmResponse(content=Content(role="model", parts=parts), partial=None)
+                chunks_yielded[0] += 1
 
-        mock_llm = SlowLLM.conversation([
-            # Long first response — gives the interrupt time to arrive mid-stream.
-            "This is the first bot response which is intentionally very long so that "
-            "the interrupt fires while the slow LLM is sleeping between chunks.",
-            # Short second response — sent after the user interrupts.
-            "Got it, here is the answer to your follow-up question.",
-        ])
+        session_service = InMemorySessionService()
+        session_params = SessionParams(app_name="agents", user_id="u1", session_id="s1")
+        await session_service.create_session(**session_params.model_dump())
 
-        agent = Agent(
-            name="test_agent",
-            model=mock_llm,
-            instruction="You are a helpful assistant.",
+        mock_llm = SlowLLM.single(
+            "This is a deliberately long bot response that streams one chunk at a time "
+            "so that the interruption frame can arrive while the runner is still sleeping "
+            "between chunks inside generate_content_async."
         )
-        app = App(
-            name="agents",
-            root_agent=agent,
-            plugins=[AdkInterruptionPlugin()],
+        agent = Agent(name="test_agent", model=mock_llm, instruction="Be helpful.")
+        app = App(name="agents", root_agent=agent, plugins=[AdkInterruptionPlugin()])
+
+        llm_service = AdkLLMService(
+            app=app,
+            session_service=session_service,
+            session_params=session_params,
         )
 
-        async with TestRunner(app=app, tts_delay=0.02) as runner:
-            await runner.join()
-            await runner.speak("Tell me a long story")
-            # interrupt_bot waits for bot-started-speaking then injects user speech.
-            # bot-started-speaking fires shortly after the first slow chunk reaches TTS,
-            # so the interrupt lands while the LLM is sleeping before chunk 2.
-            await runner.interrupt_bot("Wait, something else please", timeout=5.0)
-            # Wait for the second user turn to be responded to.
-            await runner.wait_for_response(timeout=10.0)
+        pipeline = Pipeline([llm_service])
+        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+        runner_obj = PipelineRunner()
+        pipeline_task = asyncio.create_task(runner_obj.run(task))
+        await asyncio.sleep(0.2)   # let StartFrame propagate and pipeline settle
 
-        # With the bug: all NUM_CHUNKS+1 events are yielded because __input_frame_task
-        # is blocked in _run_adk() and the VqlInterruptionFrame cannot cancel it.
-        # With the fix: only 1 event (chunk 1) is yielded before CancelledError propagates.
+        # ── Step 1: inject VqlContextFrame to start _run_adk() ──────────────
+        turn_id = uuid4().hex
+        await task.queue_frame(VqlContextFrame(turn_id=turn_id, text="Tell me a story"))
+
+        # ── Step 2: wait until the LLM has yielded chunk 1 and is sleeping ──
+        await asyncio.wait_for(first_chunk_event.wait(), timeout=5.0)
+
+        # ── Step 3: inject VqlInterruptionFrame while LLM is mid-stream ─────
+        # This should trigger _start_interruption() → cancel __process_frame_task
+        # → CancelledError propagates into the asyncio.sleep inside SlowLLM.
+        await task.queue_frame(VqlInterruptionFrame(turn_id=turn_id))
+
+        # Give cancellation time to propagate (two chunk-delays is generous).
+        await asyncio.sleep(CHUNK_DELAY * 2)
+
+        # Teardown
+        pipeline_task.cancel()
+        try:
+            await pipeline_task
+        except asyncio.CancelledError:
+            pass
+
+        # With the bug (VqlContextFrame is SystemFrame): __input_frame_task is
+        # blocked in _run_adk(); VqlInterruptionFrame waits behind it; all
+        # NUM_CHUNKS+1 events are yielded before the interrupt is processed.
+        # With the fix (VqlContextFrame is plain Frame): only chunk 1 is yielded
+        # before CancelledError kills the runner.
         self.assertLess(
             chunks_yielded[0],
             NUM_CHUNKS,
-            f"ADK runner should have been cancelled after interruption, but yielded "
-            f"{chunks_yielded[0]} of {NUM_CHUNKS} partial chunks — runner was not cancelled.",
+            f"ADK runner should have been cancelled after VqlInterruptionFrame, "
+            f"but yielded {chunks_yielded[0]} of {NUM_CHUNKS} chunks.",
         )
 
 
