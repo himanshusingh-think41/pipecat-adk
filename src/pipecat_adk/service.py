@@ -10,6 +10,7 @@ Key design points:
 - runner.run_async receives new_message directly — no pre-persisted events, no ResumabilityConfig.
 """
 
+import asyncio
 from typing import Any, Optional, Union
 from uuid import uuid4
 
@@ -134,6 +135,9 @@ class AdkLLMService(LLMService):
         # aggregator.  Only AdkLLMService knows both IDs.
         self._turn_invocation_map: dict[str, str] = {}
 
+    def can_generate_metrics(self) -> bool:
+        return True
+
     def create_context_aggregator(
         self,
         *,
@@ -223,6 +227,7 @@ class AdkLLMService(LLMService):
         """
         await self.push_frame(VqlLLMFullResponseStartFrame(turn_id=turn_id))
         await self.start_ttfb_metrics()
+        await self.start_processing_metrics()
 
         prompt_tokens = 0
         completion_tokens = 0
@@ -231,6 +236,7 @@ class AdkLLMService(LLMService):
         reasoning_tokens = 0
 
         try:
+            ttfb_stopped = False
             async for event in self.runner.run_async(
                 user_id=self.session_params.user_id,
                 session_id=self.session_params.session_id,
@@ -238,7 +244,9 @@ class AdkLLMService(LLMService):
                 state_delta=state_delta,
                 run_config=RunConfig(streaming_mode=StreamingMode.SSE),
             ):
-                await self.stop_ttfb_metrics()
+                if not ttfb_stopped:
+                    await self.stop_ttfb_metrics()
+                    ttfb_stopped = True
 
                 # Learn invocation_id from first event; store turn_id → invocation_id.
                 if event.invocation_id and turn_id not in self._turn_invocation_map:
@@ -258,8 +266,13 @@ class AdkLLMService(LLMService):
 
                 await self._push_frames_from_event(event, turn_id=turn_id)
 
+        except asyncio.TimeoutError as e:
+            logger.warning(f"{self} ADK timeout: {e}")
+            await self._call_event_handler("on_completion_timeout")
+            await self.push_error(error_msg="ADK runner timed out", exception=e)
         except Exception as e:
             logger.exception(f"{self} ADK error: {e}")
+            await self.push_error(error_msg=f"ADK runner error: {e}", exception=e)
         finally:
             await self.start_llm_usage_metrics(
                 LLMTokenUsage(
@@ -270,6 +283,7 @@ class AdkLLMService(LLMService):
                     reasoning_tokens=reasoning_tokens,
                 )
             )
+            await self.stop_processing_metrics()
             await self.push_frame(LLMFullResponseEndFrame())
 
     async def _push_frames_from_event(self, event: Event, *, turn_id: str) -> None:
