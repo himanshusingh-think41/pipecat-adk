@@ -6,7 +6,7 @@ VqlAssistantContextAggregator.  They carry turn_id but never expose ADK
 internals (invocation_id stays private to AdkLLMService).
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from pipecat.frames.frames import (
     Frame,

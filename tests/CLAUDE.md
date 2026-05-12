@@ -203,4 +203,3 @@ async def wait_for_state_sync():
 | `mocks.py` | `MockLLM`, `TestRunner`, `MockTTSService`, `MockSTTService` |
 | `test_with_mocks.py` | Main integration tests |
 | `test_state_sync.py` | State synchronization frame tests |
-| `test_utils.py` | `simplify_events()` for readable event assertions |

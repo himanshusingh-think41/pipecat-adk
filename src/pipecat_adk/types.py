@@ -1,7 +1,6 @@
 """Type definitions for pipecat-adk."""
 
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass

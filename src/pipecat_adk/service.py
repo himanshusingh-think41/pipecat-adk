@@ -11,14 +11,13 @@ Key design points:
 """
 
 import asyncio
-from typing import Any, Optional, Union
+from typing import Any, Optional
 from uuid import uuid4
 
 from google.adk.agents import BaseAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.apps.app import App
 from google.adk.events.event import Event
-from google.adk.events.event_actions import EventActions
 from google.adk.runners import Runner
 from google.adk.sessions.base_session_service import BaseSessionService
 from google.genai.types import Content, Part

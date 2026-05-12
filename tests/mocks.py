@@ -16,10 +16,9 @@ import copy
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Callable, Dict, List, Literal, Optional, Type, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Literal, Optional, Union
 from typing_extensions import override
 
-from google.adk.events import Event
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
@@ -93,9 +92,6 @@ if FAKE_AUDIO_PACKET_BYTES % FAKE_AUDIO_PADDING_GRANULARITY != 0:
         f"Fake audio packet size {FAKE_AUDIO_PACKET_BYTES} must be divisible by "
         f"{FAKE_AUDIO_PADDING_GRANULARITY}"
     )
-
-# Backwards compatibility alias
-SAMPLE_RATE = OUTPUT_SAMPLE_RATE
 
 
 # ============================================================================
@@ -931,10 +927,6 @@ class TestRunner:
         await self.transport._call_event_handler("on_participant_joined", participant)
         await self.transport._call_event_handler("on_client_connected", participant)
         self._joined = True
-
-    async def join_and_wait_for_response(self, timeout: float = 60.0):
-        await self.join()
-        await self.wait_for_response(timeout=timeout)
 
     async def speak(self, speech: str):
         self._ensure_joined()
