@@ -16,6 +16,23 @@ const sendButton = document.getElementById("send-button");
 
 let sessionId = "";
 
+function renderEmptyState() {
+  if (!messagesNode || messagesNode.children.length > 0) return;
+  const empty = document.createElement("div");
+  empty.className = "empty-state";
+  empty.id = "empty-state";
+  empty.innerHTML = `
+    <strong>Agent is ready for your first question.</strong>
+    <p>Type here to test Gemini text responses, then open the voice console for live microphone interaction.</p>
+  `;
+  messagesNode.appendChild(empty);
+}
+
+function removeEmptyState() {
+  const empty = document.getElementById("empty-state");
+  if (empty) empty.remove();
+}
+
 function setBanner(message = "") {
   if (!errorBanner) return;
   errorBanner.textContent = message;
@@ -35,6 +52,7 @@ function setSendEnabled(enabled) {
 
 function appendMessage(role, text) {
   if (!messagesNode) return;
+  removeEmptyState();
   const item = document.createElement("div");
   item.className = `message message-${role}`;
   const roleNode = document.createElement("span");
@@ -119,4 +137,5 @@ async function sendMessage(event) {
 
 void checkHealth();
 void createSession();
+renderEmptyState();
 chatForm?.addEventListener("submit", sendMessage);
