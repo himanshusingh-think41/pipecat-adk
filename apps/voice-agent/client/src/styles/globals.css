@@ -125,6 +125,7 @@ h1 {
 .chat-layout {
   grid-template-columns: 1.5fr 0.7fr;
   align-items: start;
+  margin-bottom: 28px;
 }
 
 .messages {
