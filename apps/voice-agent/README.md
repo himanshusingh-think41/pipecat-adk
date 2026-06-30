@@ -19,6 +19,7 @@ Single-agent dashboard built inside the forked `pipecat-adk` repo.
 1. Configure environment:
    - Copy `server/.env.example` to `server/.env`
    - Fill in `GEMINI_API_KEY`, `STT_API_KEY`, and `TTS_API_KEY`
+   - `STT_PROVIDER` and `TTS_PROVIDER` are expected to remain `deepgram`
 
 2. Install backend dependencies:
 
@@ -58,3 +59,9 @@ Or with the repo virtualenv:
 4. Open `/voice-console/` and test microphone flow
 
 If the backend fails on startup with a Deepgram import error, reinstall dependencies from `server/requirements.txt` because the Deepgram SDK is required by the runtime.
+
+If `/api/chat` returns a runtime error, check these first:
+- `GEMINI_API_KEY` is present
+- `STT_API_KEY` is present
+- `TTS_API_KEY` is present, or you intentionally reuse `STT_API_KEY`
+- `ADK_DATABASE_URL` points to a reachable Postgres instance

@@ -26,6 +26,18 @@ class Settings(BaseSettings):
     def effective_tts_api_key(self) -> str | None:
         return self.tts_api_key or self.stt_api_key
 
+    def validate_runtime_settings(self) -> None:
+        if not self.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY environment variable not set")
+        if self.stt_provider != "deepgram":
+            raise ValueError(f"Unsupported STT provider: {self.stt_provider}")
+        if self.tts_provider != "deepgram":
+            raise ValueError(f"Unsupported TTS provider: {self.tts_provider}")
+        if not self.stt_api_key:
+            raise ValueError("STT_API_KEY environment variable not set")
+        if not self.effective_tts_api_key:
+            raise ValueError("TTS_API_KEY or STT_API_KEY environment variable not set")
+
 
 @lru_cache
 def get_settings() -> Settings:

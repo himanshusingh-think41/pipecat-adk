@@ -36,22 +36,13 @@ class AdkDeepgramTTSService(VqlTTSMixin, DeepgramHttpTTSService):
 
 def _configure_google_api_key() -> None:
     settings = get_settings()
-    if not settings.gemini_api_key:
-        raise ValueError("GEMINI_API_KEY environment variable not set")
+    settings.validate_runtime_settings()
     os.environ.setdefault("GOOGLE_API_KEY", settings.gemini_api_key)
     os.environ.setdefault("GEMINI_API_KEY", settings.gemini_api_key)
 
 
 def _validate_audio_providers() -> None:
-    settings = get_settings()
-    if settings.stt_provider != "deepgram":
-        raise ValueError(f"Unsupported STT provider: {settings.stt_provider}")
-    if settings.tts_provider != "deepgram":
-        raise ValueError(f"Unsupported TTS provider: {settings.tts_provider}")
-    if not settings.stt_api_key:
-        raise ValueError("STT_API_KEY environment variable not set")
-    if not settings.effective_tts_api_key:
-        raise ValueError("TTS_API_KEY or STT_API_KEY environment variable not set")
+    get_settings().validate_runtime_settings()
 
 
 async def run_bot(webrtc_connection, *, session_id: str, user_id: str = "local-user"):
