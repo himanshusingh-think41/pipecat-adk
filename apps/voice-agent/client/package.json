@@ -1,0 +1,9 @@
+{
+  "name": "voice-agent-client",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "echo 'Frontend setup pending'",
+    "build": "echo 'Frontend build setup pending'"
+  }
+}
