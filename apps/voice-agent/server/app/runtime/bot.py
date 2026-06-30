@@ -1,6 +1,8 @@
 import os
 import sys
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from google.adk.sessions import DatabaseSessionService
@@ -34,6 +36,19 @@ class AdkDeepgramTTSService(VqlTTSMixin, DeepgramHttpTTSService):
     """Deepgram HTTP TTS with Vql turn_id pinning for interruption tracking."""
 
 
+class VoiceAgentLLMService(AdkLLMService):
+    """ADK service that injects current local date and time into every user turn."""
+
+    async def _build_user_event(self, text: str) -> types.Content:
+        return types.Content(
+            role="user",
+            parts=[
+                types.Part(text=_build_runtime_context()),
+                types.Part(text=text),
+            ],
+        )
+
+
 def _configure_google_api_key() -> None:
     settings = get_settings()
     settings.validate_runtime_settings()
@@ -43,6 +58,18 @@ def _configure_google_api_key() -> None:
 
 def _validate_audio_providers() -> None:
     get_settings().validate_runtime_settings()
+
+
+def _build_runtime_context() -> str:
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    return (
+        "<system>"
+        f"Current local date is {now.strftime('%B %d, %Y')}. "
+        f"Current local time is {now.strftime('%I:%M %p')} IST. "
+        "When the user asks about today, date, time, now, or current day, use this context "
+        "instead of guessing from model knowledge."
+        "</system>"
+    )
 
 
 async def run_bot(webrtc_connection, *, session_id: str, user_id: str = "local-user"):
@@ -63,7 +90,7 @@ async def run_bot(webrtc_connection, *, session_id: str, user_id: str = "local-u
     if not existing:
         await session_service.create_session(**session_params.model_dump())
 
-    llm = AdkLLMService(
+    llm = VoiceAgentLLMService(
         session_service=session_service,
         session_params=session_params,
         app=app,
@@ -191,7 +218,13 @@ async def generate_agent_response(
     )
 
     runner = Runner(app=app, session_service=session_service)
-    message = types.Content(role="user", parts=[types.Part(text=user_text)])
+    message = types.Content(
+        role="user",
+        parts=[
+            types.Part(text=_build_runtime_context()),
+            types.Part(text=user_text),
+        ],
+    )
     response_parts: list[str] = []
 
     async for event in runner.run_async(
