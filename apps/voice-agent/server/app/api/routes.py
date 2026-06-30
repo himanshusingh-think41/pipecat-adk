@@ -19,7 +19,7 @@ small_webrtc_handler = SmallWebRTCRequestHandler(ice_servers=None)
 
 @router.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "service": "voice-agent"}
 
 
 @router.post("/api/chat", response_model=ChatTurnResponse)
@@ -28,11 +28,21 @@ async def chat(payload: ChatTurnRequest) -> ChatTurnResponse:
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
 
-    assistant_text = await generate_agent_response(
-        session_id=payload.session_id,
-        user_text=message,
-        user_id=payload.user_id,
-    )
+    try:
+        assistant_text = await generate_agent_response(
+            session_id=payload.session_id,
+            user_text=message,
+            user_id=payload.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected runtime failure: {exc}",
+        ) from exc
 
     return ChatTurnResponse(
         session_id=payload.session_id,

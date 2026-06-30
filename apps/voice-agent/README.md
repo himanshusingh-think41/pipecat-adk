@@ -27,13 +27,34 @@ cd apps/voice-agent/server
 pip install -r requirements.txt
 ```
 
+If you use the repo virtualenv:
+
+```bash
+/home/think41/pipecat-adk/.venv/bin/pip install -r requirements.txt
+```
+
 3. Start the backend:
 
 ```bash
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+Or with the repo virtualenv:
+
+```bash
+/home/think41/pipecat-adk/.venv/bin/uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
 4. Open:
    - Dashboard: `http://localhost:8000/`
    - Health: `http://localhost:8000/health`
    - Voice console: `http://localhost:8000/voice-console/`
+
+## Verification Order
+
+1. `GET /health`
+2. Open the dashboard at `/`
+3. Submit one chat message through the dashboard
+4. Open `/voice-console/` and test microphone flow
+
+If the backend fails on startup with a Deepgram import error, reinstall dependencies from `server/requirements.txt` because the Deepgram SDK is required by the runtime.
