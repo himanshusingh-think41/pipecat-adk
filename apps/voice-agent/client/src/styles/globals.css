@@ -12,9 +12,9 @@ body {
 }
 
 .app-shell {
-  max-width: 1120px;
+  max-width: 1180px;
   margin: 0 auto;
-  padding: 36px 20px 56px;
+  padding: 32px 20px 48px;
 }
 
 .hero,
@@ -25,9 +25,9 @@ body {
 }
 
 .hero {
-  align-items: end;
-  grid-template-columns: 1.6fr 0.8fr;
-  margin-bottom: 24px;
+  align-items: center;
+  grid-template-columns: 1.5fr auto;
+  margin-bottom: 20px;
 }
 
 .eyebrow {
@@ -41,29 +41,32 @@ body {
 
 h1 {
   margin: 0;
-  font-size: clamp(2.4rem, 6vw, 4rem);
-  line-height: 0.95;
+  font-size: clamp(2.8rem, 7vw, 4.4rem);
+  line-height: 0.92;
 }
 
 .lede {
   max-width: 56ch;
   color: #334155;
+  margin: 14px 0 0;
+  font-size: 1.05rem;
 }
 
 .voice-link {
   justify-self: end;
   align-self: center;
-  padding: 14px 18px;
+  padding: 14px 22px;
   border-radius: 999px;
   background: #0f172a;
   color: #f8fafc;
   text-decoration: none;
   font-weight: 600;
+  box-shadow: 0 14px 28px rgba(15, 23, 42, 0.14);
 }
 
 .status-card {
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin-bottom: 24px;
+  margin-bottom: 20px;
 }
 
 .status-card > div,
@@ -75,6 +78,31 @@ h1 {
   background: rgba(255, 255, 255, 0.88);
   box-shadow: 0 18px 42px rgba(15, 23, 42, 0.08);
   backdrop-filter: blur(10px);
+}
+
+.panel-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.panel-header h2 {
+  margin: 0;
+}
+
+.panel-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: #dbeafe;
+  color: #1d4ed8;
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 
 .status-card h2,
@@ -123,19 +151,38 @@ h1 {
 }
 
 .chat-layout {
-  grid-template-columns: 1.5fr 0.7fr;
+  grid-template-columns: minmax(0, 1.55fr) minmax(300px, 0.75fr);
   align-items: start;
-  margin-bottom: 28px;
+  gap: 18px;
 }
 
 .messages {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-height: 320px;
-  max-height: 480px;
+  min-height: 260px;
+  max-height: 360px;
   overflow-y: auto;
   margin-bottom: 16px;
+  padding-right: 4px;
+}
+
+.empty-state {
+  padding: 18px;
+  border: 1px dashed #94a3b8;
+  border-radius: 18px;
+  background: rgba(248, 250, 252, 0.8);
+  color: #334155;
+}
+
+.empty-state strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.empty-state p {
+  margin: 0;
+  line-height: 1.5;
 }
 
 .message {
@@ -185,11 +232,13 @@ h1 {
 .chat-form textarea {
   width: 100%;
   resize: vertical;
-  min-height: 96px;
+  min-height: 112px;
   padding: 14px;
   border: 1px solid #cbd5e1;
   border-radius: 18px;
   font: inherit;
+  line-height: 1.5;
+  background: #fbfdff;
 }
 
 .chat-form button {
@@ -209,12 +258,59 @@ h1 {
   cursor: progress;
 }
 
+.info-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.info-group {
+  padding-bottom: 2px;
+}
+
+.info-group ol {
+  margin: 12px 0 0;
+  padding-left: 22px;
+  color: #334155;
+}
+
+.info-group li + li {
+  margin-top: 10px;
+}
+
 .muted {
   color: #64748b;
   font-size: 0.92rem;
 }
 
+.tip-card {
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: #eff6ff;
+  color: #1e3a8a;
+}
+
+.tip-card strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.tip-card p {
+  margin: 0;
+  line-height: 1.5;
+}
+
 .note {
+  color: #475569;
+  margin: 0;
+  line-height: 1.55;
+}
+
+.mini-heading {
+  display: inline-block;
+  margin-bottom: 8px;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
   color: #475569;
 }
 
@@ -232,5 +328,9 @@ h1 {
   .chat-actions {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .messages {
+    max-height: none;
   }
 }
