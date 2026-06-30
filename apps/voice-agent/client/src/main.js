@@ -8,12 +8,30 @@ if (root) {
 
 const healthStatus = document.getElementById("health-status");
 const sessionIdNode = document.getElementById("session-id");
+const errorBanner = document.getElementById("error-banner");
 const messagesNode = document.getElementById("messages");
 const chatForm = document.getElementById("chat-form");
 const messageInput = document.getElementById("message-input");
 const sendButton = document.getElementById("send-button");
 
 let sessionId = "";
+
+function setBanner(message = "") {
+  if (!errorBanner) return;
+  errorBanner.textContent = message;
+  errorBanner.classList.toggle("hidden", !message);
+}
+
+function setStatus(node, text, variant) {
+  if (!node) return;
+  node.textContent = text;
+  node.className = `status-pill status-${variant}`;
+}
+
+function setSendEnabled(enabled) {
+  if (!sendButton) return;
+  sendButton.disabled = !enabled;
+}
 
 function appendMessage(role, text) {
   if (!messagesNode) return;
@@ -33,14 +51,15 @@ async function checkHealth() {
   try {
     const response = await fetch("/health");
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    if (healthStatus) healthStatus.textContent = "Ready";
+    setStatus(healthStatus, "Ready", "ready");
   } catch (error) {
-    if (healthStatus) healthStatus.textContent = `Unavailable: ${error.message}`;
+    setStatus(healthStatus, `Unavailable: ${error.message}`, "error");
+    setBanner("Backend health check failed. Confirm the FastAPI server is still running.");
   }
 }
 
 async function createSession() {
-  try {
+    try {
     const response = await fetch("/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -49,11 +68,12 @@ async function createSession() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json();
     sessionId = payload.sessionId || "";
-    if (sessionIdNode) {
-      sessionIdNode.textContent = sessionId || "Session not created";
-    }
+    if (!sessionId) throw new Error("Session id missing from response");
+    setStatus(sessionIdNode, sessionId, "ready");
+    setSendEnabled(true);
   } catch (error) {
-    if (sessionIdNode) sessionIdNode.textContent = `Failed: ${error.message}`;
+    setStatus(sessionIdNode, `Failed: ${error.message}`, "error");
+    setBanner("Session creation failed. Reload the page after checking server logs.");
   }
 }
 
@@ -62,6 +82,7 @@ async function sendMessage(event) {
   const message = messageInput?.value.trim() || "";
   if (!message || !sessionId) return;
 
+  setBanner("");
   appendMessage("user", message);
   messageInput.value = "";
   if (sendButton) {
@@ -86,6 +107,7 @@ async function sendMessage(event) {
 
     appendMessage("assistant", payload.assistant_text);
   } catch (error) {
+    setBanner(`Agent request failed: ${error.message}`);
     appendMessage("assistant", `Error: ${error.message}`);
   } finally {
     if (sendButton) {

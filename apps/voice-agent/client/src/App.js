@@ -18,13 +18,15 @@ export function App() {
       <section class="status-card">
         <div>
           <h2>Backend Status</h2>
-          <p id="health-status">Checking backend health...</p>
+          <p id="health-status" class="status-pill status-pending">Checking backend health...</p>
         </div>
         <div>
           <h2>Session</h2>
-          <p id="session-id">Creating session...</p>
+          <p id="session-id" class="status-pill status-pending">Creating session...</p>
         </div>
       </section>
+
+      <div id="error-banner" class="error-banner hidden" role="alert"></div>
 
       <section class="chat-layout">
         <div class="chat-panel">
@@ -35,7 +37,10 @@ export function App() {
               rows="3"
               placeholder="Ask the voice agent a question..."
             ></textarea>
-            <button id="send-button" type="submit">Send</button>
+            <div class="chat-actions">
+              <span class="muted">Text chat is already connected to the same agent runtime.</span>
+              <button id="send-button" type="submit" disabled>Send</button>
+            </div>
           </form>
         </div>
 
