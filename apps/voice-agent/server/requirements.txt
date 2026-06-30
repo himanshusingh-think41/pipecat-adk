@@ -1,0 +1,10 @@
+fastapi[all]
+uvicorn
+python-dotenv
+pydantic-settings
+asyncpg
+aiohttp
+pipecat-ai[google,silero,webrtc,deepgram]
+pipecat-ai-small-webrtc-prebuilt
+google-adk
+loguru
